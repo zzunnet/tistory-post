@@ -10,6 +10,9 @@ import os
 import json
 import re
 import time
+from dotenv import load_dotenv
+
+load_dotenv()  # .env 파일에서 ANTHROPIC_API_KEY 로드
 
 from anthropic import Anthropic
 from playwright.sync_api import sync_playwright
@@ -17,8 +20,8 @@ from playwright.sync_api import sync_playwright
 # ─────────────────────────────────────────
 # 설정 (여기만 수정)
 # ─────────────────────────────────────────
-KAKAO_EMAIL    = "zzunnet@gmail.com"
-KAKAO_PASSWORD = "cks99kak"
+KAKAO_EMAIL    = os.environ["KAKAO_EMAIL"]
+KAKAO_PASSWORD = os.environ["KAKAO_PASSWORD"]
 BLOG_NAME      = "zzun"                 # zzun.tistory.com
 CATEGORY       = "IT / 보안"           # 티스토리 카테고리 (상위 / 하위)
 

@@ -4,16 +4,20 @@ Tistory 자동 발행 스크립트
 """
 
 import sys
+import os
 sys.stdout.reconfigure(encoding='utf-8')
 
 from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
 import time
+
+load_dotenv()  # .env 파일에서 자격증명 로드
 
 # ─────────────────────────────────────────
 # ✏️  여기만 수정하세요
 # ─────────────────────────────────────────
-KAKAO_EMAIL    = "zzunnet@gmail.com"   # 카카오 로그인 이메일
-KAKAO_PASSWORD = "cks99kak"           # 카카오 로그인 비밀번호
+KAKAO_EMAIL    = os.environ["KAKAO_EMAIL"]
+KAKAO_PASSWORD = os.environ["KAKAO_PASSWORD"]
 BLOG_NAME      = "zzun"               # zzun.tistory.com
 
 TITLE = "HSM이 PQC 전환의 병목이 되는 이유 — CA 운영자 시각에서"
