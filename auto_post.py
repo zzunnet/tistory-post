@@ -1,20 +1,22 @@
 """
-Claude 대화 기반 티스토리 자동 포스팅
+Claude·Gemini 대화 기반 티스토리 자동 포스팅 (Gemini 2.0 Flash)
 사용법: python auto_post.py
-사전 준비: export ANTHROPIC_API_KEY="sk-ant-..."
+사전 준비: .env 파일에 GEMINI_API_KEY, KAKAO_EMAIL, KAKAO_PASSWORD 설정
 """
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
 
 import os
+import glob
 import json
 import re
 import time
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()  # .env 파일에서 ANTHROPIC_API_KEY 로드
+load_dotenv()  # .env 파일에서 키 로드
 
-from anthropic import Anthropic
+from google import genai
 from playwright.sync_api import sync_playwright
 
 # ─────────────────────────────────────────
@@ -25,8 +27,9 @@ KAKAO_PASSWORD = os.environ["KAKAO_PASSWORD"]
 BLOG_NAME      = "zzun"                 # zzun.tistory.com
 CATEGORY       = "IT / 보안"           # 티스토리 카테고리 (상위 / 하위)
 
-MAX_SESSIONS        = 5    # 참고할 최근 세션 수
+MAX_SESSIONS        = 5    # 참고할 최근 Claude 세션 수
 MAX_MSG_PER_SESSION = 30   # 세션당 최대 메시지 수
+MAX_GEMINI_SESSIONS = 5    # 참고할 최근 Gemini 세션 수
 # ─────────────────────────────────────────
 
 
@@ -71,61 +74,139 @@ def get_recent_conversations() -> list[str]:
 
 
 # ──────────────────────────────────────────────────
-# Step 2. Claude Opus 4.6 으로 포스트 생성
+# Step 1b. 최근 Gemini CLI 대화 수집
 # ──────────────────────────────────────────────────
-def generate_blog_post(conv_texts: list[str]) -> tuple[str, str, str]:
-    """Claude Opus 4.6 (adaptive thinking) 으로 블로그 포스트를 생성합니다."""
-    client = Anthropic()
+def get_gemini_conversations() -> list[str]:
+    """~/.gemini/tmp/*/chats/*.json 에서 최근 Gemini 대화를 수집합니다."""
+    gemini_dir = Path.home() / ".gemini" / "tmp"
+    if not gemini_dir.exists():
+        print("  Gemini 대화 디렉터리 없음, 스킵")
+        return []
+
+    # 모든 session JSON 파일을 수정 시각 최신순으로 정렬
+    session_files = sorted(
+        gemini_dir.glob("*/chats/session-*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+    print(f"  Gemini 세션 파일: {len(session_files)}개 발견")
+
+    texts = []
+    for session_file in session_files[:MAX_GEMINI_SESSIONS]:
+        try:
+            data = json.loads(session_file.read_text(encoding="utf-8"))
+            messages = data.get("messages", [])
+            for msg in messages:
+                msg_type = msg.get("type", "")
+                if msg_type not in ("user", "gemini"):
+                    continue
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for block in content:
+                        t = block.get("text", "") if isinstance(block, dict) else str(block)
+                        if t and len(t.strip()) > 30:
+                            texts.append(t.strip()[:1000])
+                elif isinstance(content, str) and len(content.strip()) > 30:
+                    texts.append(content.strip()[:1000])
+        except Exception as e:
+            print(f"  Gemini 세션 오류 ({session_file.name}): {e}")
+
+    print(f"  Gemini 수집 텍스트 블록: {len(texts)}개")
+    return texts
+
+
+# ──────────────────────────────────────────────────
+# Step 2. Gemini 2.0 Flash 로 포스트 생성
+# ──────────────────────────────────────────────────
+def generate_blog_post(conv_texts: list[str]) -> tuple[str, str, str, str]:
+    """Gemini 로 블로그 포스트를 생성합니다. (title, content, tags, category) 반환"""
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     combined = "\n\n".join(conv_texts[:40])
     if len(combined) > 15000:
         combined = combined[:15000] + "\n\n...(이하 생략)"
 
-    print("  Claude Opus 4.6 스트리밍 중...")
-
-    with client.messages.stream(
-        model="claude-opus-4-6",
-        max_tokens=8000,
-        thinking={"type": "adaptive"},
-        system="""당신은 IT·보안·PKI·암호화·개발 분야 전문 기술 블로그 작가입니다.
-주어진 Claude 대화 내용을 분석해 핵심 기술 주제를 발굴하고,
+    prompt = f"""당신은 IT·보안·PKI·암호화·개발 분야 전문 기술 블로그 작가입니다.
+아래 Claude 대화 내용을 분석해 핵심 기술 주제를 발굴하고,
 실무자·개발자에게 가치 있는 블로그 포스트를 작성하세요.
 
-반드시 아래 JSON 형식으로만 응답하세요 (추가 텍스트 없이):
-{
-  "title": "흥미롭고 구체적인 제목 (60자 이내)",
-  "content": "HTML 본문 (h2/h3/p/ul/li/strong/em/hr/code 태그 사용, 최소 1500자)",
-  "tags": "태그1,태그2,...,태그10 (최대 10개, 쉼표 구분)"
-}
+[중요] 반드시 아래 규칙을 따르세요:
+1. 순수 JSON 객체만 반환 (마크다운 코드블록 없이)
+2. content 필드의 HTML 안에서 큰따옴표(") 사용 금지 → 작은따옴표(') 사용
+3. content 필드의 HTML 안에서 역슬래시(\\) 사용 금지
+4. JSON 이외의 텍스트 일절 없이
+
+반환 형식:
+{{"title": "제목 (60자 이내)", "content": "HTML 본문 (h2/h3/p/ul/li/strong/em/code 태그 사용, 최소 1500자, 큰따옴표 금지)", "tags": "태그1,태그2,...,태그10", "category": "IT/개발 또는 IT/보안 중 하나"}}
+
+카테고리 선택 기준:
+- IT/보안: 암호화, PQC, HSM, PKI, 인증서, 보안 취약점, 금융보안 관련
+- IT/개발: 프로그래밍, 자동화, 웹개발, 디버깅, 라이브러리, 도구 관련
 
 작성 지침:
 - 대화에서 실제로 다룬 기술 주제 기반
 - 서론 → 본론(3~4섹션) → 결론 구조
 - 독자가 실무에 바로 적용할 수 있는 인사이트 포함
 - 전문 용어는 간단한 설명 병기
-- 날짜/시간 정보 포함 금지 (포스팅 날짜와 혼동)""",
-        messages=[{
-            "role": "user",
-            "content": f"아래 Claude 대화를 기반으로 블로그 포스트를 작성해주세요:\n\n{combined}"
-        }]
-    ) as stream:
-        response = stream.get_final_message()
+- 날짜/시간 정보 포함 금지
 
-    text = next((b.text for b in response.content if b.type == "text"), "")
+=== Claude 대화 내용 ===
+{combined}"""
+
+    # quota 소진 시 fallback 순서로 시도
+    models = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-2.5-flash"]
+    response = None
+    for model_name in models:
+        try:
+            print(f"  {model_name} 생성 중...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            break
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                print(f"  {model_name} quota 소진, 다음 모델 시도...")
+                continue
+            raise
+    if response is None:
+        raise RuntimeError("모든 Gemini 모델 quota 소진. 내일 다시 시도하세요.")
+
+    text = response.text.strip()
+    # 마크다운 코드블록 제거
+    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\s*```\s*$', '', text, flags=re.MULTILINE)
 
     json_match = re.search(r'\{[\s\S]*\}', text)
     if not json_match:
         raise ValueError(f"JSON 추출 실패:\n{text[:400]}")
 
-    data = json.loads(json_match.group())
-    title   = data['title']
-    content = data['content']
-    tags    = data['tags']
+    raw_json = json_match.group()
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError:
+        # content 필드 안의 HTML을 별도로 추출해 파싱
+        title_m   = re.search(r'"title"\s*:\s*"([^"]*)"', raw_json)
+        content_m = re.search(r'"content"\s*:\s*"([\s\S]*?)"\s*,\s*"tags"', raw_json)
+        tags_m    = re.search(r'"tags"\s*:\s*"([^"]*)"', raw_json)
+        if not (title_m and content_m and tags_m):
+            raise ValueError(f"JSON 파싱 실패:\n{raw_json[:400]}")
+        data = {
+            "title":    title_m.group(1),
+            "content":  content_m.group(1).replace('\\"', '"'),
+            "tags":     tags_m.group(1),
+            "category": "IT/개발",
+        }
+    title    = data['title']
+    content  = data['content']
+    tags     = data['tags']
+    category = data.get('category', 'IT/개발')
 
     print(f"  제목: {title}")
+    print(f"  카테고리: {category}")
     print(f"  태그: {tags}")
     print(f"  본문: {len(content)}자")
-    return title, content, tags
+    return title, content, tags, category
 
 
 # ──────────────────────────────────────────────────
@@ -168,52 +249,47 @@ def _login(page, blog_name: str, email: str, password: str):
 
 
 def _select_category(page, category: str):
-    """발행 패널에서 카테고리(상위/하위)를 선택합니다.
-    티스토리 드롭다운: 상위='IT', 하위='- 보안' (대시+공백 접두사)
+    """에디터 상단 카테고리 드롭다운에서 카테고리를 선택합니다.
+    티스토리: 상위='IT', 하위='- 보안' (대시+공백 접두사)
     """
     try:
-        cat_btn = page.locator("button:has-text('선택 안 함')")
-        if cat_btn.count() == 0:
+        # 에디터 상단 카테고리 버튼 — 버튼 목록에서 "카테고리" 포함된 첫 버튼
+        cat_btn = None
+        for btn in page.locator("button").all():
+            try:
+                if "카테고리" in btn.inner_text():
+                    cat_btn = btn
+                    break
+            except Exception:
+                continue
+        if cat_btn is None:
             print("  카테고리 버튼 없음, 스킵")
             return
 
-        cat_btn.first.click()
+        cat_btn.click()
         time.sleep(1.5)
 
-        # "IT/보안" → parent="IT", child="보안"
+        # 드롭다운: div[role="option"][aria-label="..."] 구조
+        # 하위 카테고리("- 보안")가 이미 목록에 있으므로 바로 클릭
+        # "IT/보안" → label = "- 보안"
         parts = [p.strip() for p in category.split("/")]
-
         if len(parts) >= 2:
-            parent_name, child_name = parts[0], parts[1]
-
-            # 1) 상위 카테고리 클릭 (아코디언 열기)
-            # 텍스트가 정확히 parent_name인 li 선택
-            all_li = page.locator("li").all()
-            for li in all_li:
-                if li.inner_text().strip() == parent_name:
-                    li.click()
-                    time.sleep(0.8)
-                    break
-
-            # 2) 하위 카테고리 클릭
-            # 티스토리는 하위 항목을 "- 보안" 형태로 표시
-            child_display = f"- {child_name}"
-            for li in page.locator("li").all():
-                text = li.inner_text().strip()
-                if text == child_display or text == child_name:
-                    li.click()
-                    time.sleep(0.5)
-                    print(f"  카테고리 선택: {parent_name} / {child_name}")
-                    return
-
-            print(f"  하위 카테고리 '{child_display}' 못찾음, 상위만 선택")
+            label = f"- {parts[1]}"
         else:
-            # 단일 카테고리
-            items = page.locator(f"li:has-text('{parts[0]}')").all()
-            if items:
-                items[0].click()
-                time.sleep(0.5)
-                print(f"  카테고리 선택: {parts[0]}")
+            label = parts[0]
+
+        clicked = page.evaluate(f"""
+            () => {{
+                const el = document.querySelector('[role="option"][aria-label="{label}"]');
+                if (el) {{ el.click(); return true; }}
+                return false;
+            }}
+        """)
+        time.sleep(0.5)
+        if clicked:
+            print(f"  카테고리 선택: '{label}'")
+        else:
+            print(f"  카테고리 항목 없음: '{label}'")
 
     except Exception as e:
         print(f"  카테고리 선택 오류: {e}")
@@ -280,7 +356,12 @@ def post_to_tistory(title: str, content: str, tags: str, category: str = CATEGOR
         print(f"  본문 결과: {result}")
         time.sleep(1)
 
-        # 5. 태그
+        # 5. 카테고리 선택 (에디터 상단, 발행 패널 열기 전)
+        if category:
+            print("  카테고리 선택...")
+            _select_category(page, category)
+
+        # 6. 태그
         print("  태그 입력...")
         tag_input = page.locator("input[placeholder*='태그']")
         if tag_input.count() > 0:
@@ -289,14 +370,10 @@ def post_to_tistory(title: str, content: str, tags: str, category: str = CATEGOR
             page.keyboard.press("Enter")
         time.sleep(1)
 
-        # 6. 발행 패널
+        # 7. 발행 패널
         print("  발행 패널 열기...")
         page.click("button:has-text('완료')")
         time.sleep(3)
-
-        # 7. 카테고리
-        if category:
-            _select_category(page, category)
 
         # 8. 공개 라디오 선택
         page.evaluate("""
@@ -321,7 +398,15 @@ def post_to_tistory(title: str, content: str, tags: str, category: str = CATEGOR
                 time.sleep(3)
                 break
 
-        page.wait_for_load_state("networkidle", timeout=15000)
+        # 발행 후 글 목록 또는 글 URL로 이동 대기
+        try:
+            page.wait_for_url(
+                lambda url: "newpost" not in url,
+                timeout=10000
+            )
+        except Exception:
+            pass
+        page.wait_for_load_state("networkidle", timeout=10000)
         final_url = page.url
         print(f"  발행 완료! URL: {final_url}")
         browser.close()
@@ -336,25 +421,32 @@ if __name__ == "__main__":
     print("  Claude 대화 기반 티스토리 자동 포스팅")
     print("=" * 55)
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("\n❌ ANTHROPIC_API_KEY 환경변수가 없습니다.")
-        print("   아래 명령어로 설정 후 재실행하세요:")
-        print("   export ANTHROPIC_API_KEY='sk-ant-...'")
+    if not os.environ.get("GEMINI_API_KEY"):
+        print("\n❌ GEMINI_API_KEY 환경변수가 없습니다.")
+        print("   .env 파일에 GEMINI_API_KEY=... 를 추가하세요.")
         sys.exit(1)
 
-    # Step 1
+    # Step 1: Claude 대화 수집
     print("\n📥 Step 1: Claude 대화 수집")
     conv_texts = get_recent_conversations()
+
+    # Step 1b: Gemini 대화 수집
+    print("\n📥 Step 1b: Gemini 대화 수집")
+    gemini_texts = get_gemini_conversations()
+    conv_texts = conv_texts + gemini_texts
+
     if not conv_texts:
-        print("  대화 없음 → IT/보안 기본 주제로 진행")
+        print("  대화 없음 → IT/개발 기본 주제로 진행")
         conv_texts = [
-            "IT 보안, PKI, 인증서 관리, 암호화 알고리즘, 양자내성암호(PQC), HSM, 금융 보안"
+            "IT 개발, 자동화, 프로그래밍, 웹 스크래핑, Python, API 연동, 디버깅"
         ]
 
+    print(f"\n  총 수집 블록: {len(conv_texts)}개 (Claude + Gemini)")
+
     # Step 2
-    print("\n✍️  Step 2: 포스트 생성 (Claude Opus 4.6)")
-    title, content, tags = generate_blog_post(conv_texts)
+    print("\n✍️  Step 2: 포스트 생성 (Gemini)")
+    title, content, tags, category = generate_blog_post(conv_texts)
 
     # Step 3
     print("\n🚀 Step 3: 티스토리 포스팅")
-    post_to_tistory(title, content, tags)
+    post_to_tistory(title, content, tags, category)
