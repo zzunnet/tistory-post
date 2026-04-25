@@ -168,7 +168,9 @@ def _login(page, blog_name: str, email: str, password: str):
 
 
 def _select_category(page, category: str):
-    """발행 패널에서 카테고리(상위/하위)를 선택합니다."""
+    """발행 패널에서 카테고리(상위/하위)를 선택합니다.
+    티스토리 드롭다운: 상위='IT', 하위='- 보안' (대시+공백 접두사)
+    """
     try:
         cat_btn = page.locator("button:has-text('선택 안 함')")
         if cat_btn.count() == 0:
@@ -178,30 +180,33 @@ def _select_category(page, category: str):
         cat_btn.first.click()
         time.sleep(1.5)
 
-        # "IT / 보안" → parent="IT", child="보안"
+        # "IT/보안" → parent="IT", child="보안"
         parts = [p.strip() for p in category.split("/")]
 
         if len(parts) >= 2:
             parent_name, child_name = parts[0], parts[1]
 
             # 1) 상위 카테고리 클릭 (아코디언 열기)
-            parent_locator = page.locator(f"li:has-text('{parent_name}')")
-            matched = [li for li in parent_locator.all()
-                       if li.inner_text().strip().startswith(parent_name)]
-            if matched:
-                matched[0].click()
-                time.sleep(0.8)
+            # 텍스트가 정확히 parent_name인 li 선택
+            all_li = page.locator("li").all()
+            for li in all_li:
+                if li.inner_text().strip() == parent_name:
+                    li.click()
+                    time.sleep(0.8)
+                    break
 
             # 2) 하위 카테고리 클릭
-            child_locator = page.locator(f"li:has-text('{child_name}')")
-            matched_child = [li for li in child_locator.all()
-                             if li.inner_text().strip().startswith(child_name)]
-            if matched_child:
-                matched_child[0].click()
-                time.sleep(0.5)
-                print(f"  카테고리 선택: {parent_name} / {child_name}")
-            else:
-                print(f"  하위 카테고리 '{child_name}' 못찾음, 상위만 선택")
+            # 티스토리는 하위 항목을 "- 보안" 형태로 표시
+            child_display = f"- {child_name}"
+            for li in page.locator("li").all():
+                text = li.inner_text().strip()
+                if text == child_display or text == child_name:
+                    li.click()
+                    time.sleep(0.5)
+                    print(f"  카테고리 선택: {parent_name} / {child_name}")
+                    return
+
+            print(f"  하위 카테고리 '{child_display}' 못찾음, 상위만 선택")
         else:
             # 단일 카테고리
             items = page.locator(f"li:has-text('{parts[0]}')").all()
