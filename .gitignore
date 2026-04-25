@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Debug screenshots
+*.png
+
+# IntelliJ
+.idea/
+*.iml
+
+# Environment
+.env
