@@ -7,11 +7,10 @@ import sys
 sys.stdout.reconfigure(encoding='utf-8')
 
 import os
-import base64
 import glob
+import hashlib
 import json
 import re
-import tempfile
 import time
 from pathlib import Path
 from dotenv import load_dotenv
@@ -154,40 +153,50 @@ def save_posted_topic(topic: str):
 
 
 # ──────────────────────────────────────────────────
-# 이미지 생성 (Gemini Imagen)
+# 이미지 URL 생성 (Picsum Photos — 무료, API 키 불필요)
 # ──────────────────────────────────────────────────
-def generate_topic_image(topic_keyword: str) -> bytes | None:
-    """Gemini Imagen으로 주제 관련 이미지를 생성합니다. 실패 시 None 반환."""
-    try:
-        from google.genai import types as gtypes
-        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-        prompt = (
-            f"Professional blog cover illustration for the topic: {topic_keyword}. "
-            "Modern minimalist flat design, no text, clean composition, "
-            "vibrant yet professional color palette, high quality digital art."
+def _picsum_url(keyword: str, width: int = 800, height: int = 420) -> str:
+    """키워드를 시드로 결정론적 Picsum 이미지 URL 반환."""
+    seed = int(hashlib.md5(keyword.encode()).hexdigest(), 16) % 1000
+    return f"https://picsum.photos/seed/{seed}/{width}/{height}"
+
+
+def build_content_with_images(content_html: str, topic_keyword: str) -> str:
+    """본문 HTML의 각 <h2> 섹션 뒤에 Picsum 이미지를 삽입합니다."""
+    import hashlib as _hm
+
+    # h2 태그를 기준으로 분리
+    parts = re.split(r'(<h2[^>]*>.*?</h2>)', content_html, flags=re.IGNORECASE)
+    if len(parts) <= 1:
+        # h2가 없으면 첫머리에만 삽입
+        img_url = _picsum_url(topic_keyword)
+        img_tag = (
+            f'<figure style="text-align:center;margin:24px 0;">'
+            f'<img src="{img_url}" alt="{topic_keyword}" '
+            f'style="max-width:100%;border-radius:10px;" />'
+            f'</figure>\n'
         )
-        imagen_models = [
-            "imagen-4.0-fast-generate-001",
-            "imagen-4.0-generate-001",
-        ]
-        for model_name in imagen_models:
-            try:
-                response = client.models.generate_images(
-                    model=model_name,
-                    prompt=prompt,
-                    config=gtypes.GenerateImagesConfig(number_of_images=1, aspect_ratio="16:9"),
+        return img_tag + content_html
+
+    result = []
+    h2_count = 0
+    for part in parts:
+        result.append(part)
+        if re.match(r'<h2', part, re.IGNORECASE):
+            h2_count += 1
+            # 첫 번째와 세 번째 h2 뒤에만 이미지 삽입 (너무 많으면 지저분)
+            if h2_count in (1, 3):
+                seed_kw = f"{topic_keyword}-{h2_count}"
+                img_url = _picsum_url(seed_kw)
+                img_tag = (
+                    f'<figure style="text-align:center;margin:20px 0 28px;">'
+                    f'<img src="{img_url}" alt="{topic_keyword}" '
+                    f'style="max-width:100%;border-radius:10px;" />'
+                    f'</figure>\n'
                 )
-                img_bytes = response.generated_images[0].image.image_bytes
-                print(f"  이미지 생성 완료 ({model_name}): {len(img_bytes):,} bytes")
-                return img_bytes
-            except Exception as e:
-                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or "quota" in str(e).lower():
-                    print(f"  {model_name} quota 소진, 다음 시도...")
-                    continue
-                raise
-    except Exception as e:
-        print(f"  이미지 생성 실패 ({type(e).__name__}): {e}")
-    return None
+                result.append(img_tag)
+
+    return "".join(result)
 
 
 # ──────────────────────────────────────────────────
@@ -257,29 +266,40 @@ def analyze_topics(conv_texts: list[str], n: int = MAX_POSTS,
 """
 
     cat_list = "\n".join(f"- {c}" for c in BLOG_CATEGORIES)
-    prompt = f"""당신은 블로그 편집장입니다.
-아래 대화 기록을 읽고, 각각 독립적인 블로그 포스트로 쓸 수 있는 주제를 정확히 {n}개 추출하세요.
 
-규칙:
-1. {n}개의 주제는 반드시 서로 다른 카테고리여야 합니다 — 같은 카테고리 반복 절대 금지
-2. 특히 IT/개발 카테고리는 최대 1개만 허용
-3. 대화 내용뿐 아니라 대화에서 추론할 수 있는 필자의 관심사, 경험, 라이프스타일도 주제로 활용 가능
-4. 순수 JSON 배열만 반환 (마크다운·설명 없이)
-5. 각 항목: {{"topic": "주제명(20자 이내)", "focus": "이 포스트에서 집중할 핵심 내용(100자 이내)", "category": "아래 목록 중 정확히 하나"}}
-6. 개인 이름, 회사명, 이메일, API 키, 비밀번호 등 개인·기밀 정보 관련 주제 금지{avoid_section}
+    # 비IT 카테고리를 최소 몇 개 요구할지 계산
+    non_it_required = max(1, n - 1)  # IT계열은 최대 1개, 나머지는 비IT
 
-선택 가능한 카테고리 (이 목록에서만 골라야 함):
+    prompt = f"""당신은 다양한 관심사를 가진 한국인 개발자의 블로그 편집장입니다.
+아래 대화 기록을 분석해 독립적인 블로그 포스트 주제 {n}개를 선정하세요.
+
+[필수 조건 — 반드시 지킬 것]
+1. {n}개 모두 서로 다른 카테고리여야 합니다
+2. IT 관련 카테고리(IT/개발·IT/보안·IT/면접)는 합쳐서 최대 1개만 허용
+3. 나머지 {non_it_required}개는 반드시 비IT 카테고리(일상·여행·리뷰·스크랩북·사진)에서 선택
+4. 비IT 주제는 대화에서 직접 언급되지 않아도 됩니다 — 필자의 성격·라이프스타일에서 자유롭게 추론하세요
+   예) 개발자가 자동화 도구 만드는 것 → 효율 추구 성향 → "개발자의 생산성 루틴" (일상)
+   예) AI 음악 프로젝트 → 음악 취미 → 국내외 공연장·음악 여행 소재 (여행)
+   예) 영상 자동화 → 영화·OTT 관심 → 최근 본 영화 리뷰 (리뷰/영화)
+5. 순수 JSON 배열만 반환 (마크다운·설명 없이)
+6. 각 항목: {{"topic": "주제명(20자 이내)", "focus": "이 포스트에서 집중할 핵심 내용(100자 이내)", "category": "아래 목록 중 정확히 하나"}}
+7. 개인 이름, 회사명, 이메일, API 키, 비밀번호 등 개인·기밀 정보 관련 주제 금지{avoid_section}
+
+[카테고리 정의 — 경계를 엄격히 지킬 것]
 {cat_list}
 
-카테고리 선택 기준 및 예시 주제:
-- IT/개발: 프로그래밍, 자동화, 웹개발, 라이브러리, API — 최대 1개만
-- IT/보안: 암호화, PQC, HSM, PKI, 인증서, 보안 취약점
-- IT/면접: 개발자 면접 질문, 기술 역량, 이력서 팁
-- 일상: 개발자의 일상, 워라밸, 생산성, 사용하는 도구 이야기
-- 스크랩북/경제: IT 업계 경제 동향, 재테크, 투자
-- 여행: 여행 경험·계획, 국내외 관광지
-- 리뷰/잡화·리뷰/영화 등: 사용하는 장비, 최근 본 영화, 구매 후기
-- 사진: 촬영 기법, 장비 리뷰, 사진 작품
+카테고리별 기준:
+- IT/개발: 소스코드, 라이브러리, 프레임워크, 개발 도구, API 연동, 배포 기술 (웹 앱 배포도 여기)
+- IT/보안: 암호화, PKI, 인증서, 보안 취약점, 해킹 방어
+- IT/면접: 개발자 채용, 기술 면접 질문, 이력서·포트폴리오
+- 일상: 일상 에세이, 취미, 루틴, 감상, 개인 생각
+- 스크랩북/경제: 주식·부동산·재테크·경제 뉴스 (IT 배포 비용은 경제가 아닌 IT/개발)
+- 여행: 국내외 여행지, 숙박, 맛집, 여행 계획
+- 리뷰/잡화: 생활용품, 전자기기, 문구 등 구매 후기
+- 리뷰/영화: 영화·드라마·OTT 감상
+- 리뷰/놀이시설: 테마파크, 전시회, 공연
+- 리뷰/장난감: 피규어, 보드게임, 완구
+- 사진: 촬영 기법, 카메라 장비, 사진 작품 공유
 
 === 대화 내용 ===
 {combined}"""
@@ -315,13 +335,27 @@ def generate_blog_post(topic: dict, conv_texts: list[str]) -> tuple[str, str, st
     if len(combined) > 12000:
         combined = combined[:12000] + "\n\n...(이하 생략)"
 
-    prompt = f"""당신은 IT·보안·개발 분야 전문 기술 블로그 작가입니다.
+    category_str = topic.get('category', 'IT/개발')
+
+    # 대화에서 YouTube 채널/영상 URL 추출 (있으면 프롬프트에 전달)
+    yt_urls = re.findall(
+        r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w\-]{11}[^\s]*',
+        "\n".join(combined.split("\n")[:200])
+    )
+    yt_section = ""
+    if yt_urls:
+        yt_section = (
+            "\n\n참고할 수 있는 YouTube 링크 (관련 있으면 본문 iframe 또는 링크로 자연스럽게 포함):\n"
+            + "\n".join(yt_urls[:3])
+        )
+
+    prompt = f"""당신은 다양한 분야의 블로그 작가입니다.
 아래 지정된 주제 하나에만 집중하여 블로그 포스트를 작성하세요.
 
 [작성 주제]
 - 주제명: {topic.get('topic', '')}
 - 핵심 포커스: {topic.get('focus', '')}
-- 카테고리: {topic.get('category', 'IT/개발')}
+- 카테고리: {category_str}
 
 [중요 규칙]
 1. 순수 JSON 객체만 반환 (마크다운 코드블록 없이)
@@ -329,16 +363,16 @@ def generate_blog_post(topic: dict, conv_texts: list[str]) -> tuple[str, str, st
 3. content 필드의 HTML 안에서 역슬래시(\\) 사용 금지
 4. JSON 이외의 텍스트 일절 없이
 5. 위 주제 외 다른 주제 내용 포함 금지
-6. 실제 사람 이름, 회사명, 이메일 주소, API 키, 비밀번호, 인증 토큰 등 개인정보·기밀정보 절대 포함 금지
+6. 실제 사람 이름, 이메일 주소, API 키, 비밀번호, 인증 토큰 등 개인정보·기밀정보 절대 포함 금지
 
 반환 형식:
-{{"title": "제목 (60자 이내)", "content": "HTML 본문 (h2/h3/p/ul/li/strong/em/code 태그, 최소 1500자, 큰따옴표 금지)", "tags": "태그1,태그2,...,태그10", "category": "{topic.get('category', 'IT/개발')}"}}
+{{"title": "제목 (60자 이내)", "content": "HTML 본문 (h2/h3/p/ul/li/strong/em/code 태그, 최소 1500자, 큰따옴표 금지)", "tags": "태그1,태그2,...,태그10", "category": "{category_str}"}}
 
 작성 지침:
-- 서론 → 본론(3~4섹션) → 결론 구조
-- 독자가 실무에 바로 적용할 수 있는 인사이트
-- 전문 용어는 간단한 설명 병기
-- 날짜/시간 정보 포함 금지
+- 서론 → 본론(3~4섹션, 각 섹션은 <h2> 태그로 시작) → 결론 구조
+- 카테고리 {category_str}에 어울리는 톤과 내용 (IT 카테고리면 기술적, 여행/일상이면 감성적·실용적)
+- 독자에게 실질적으로 도움이 되는 인사이트 포함
+- 날짜/시간 정보 포함 금지{yt_section}
 
 === 참고 대화 내용 ===
 {combined}"""
@@ -349,12 +383,15 @@ def generate_blog_post(topic: dict, conv_texts: list[str]) -> tuple[str, str, st
     title    = data['title']
     content  = data['content']
     tags     = data['tags']
-    category = data.get('category', topic.get('category', 'IT/개발'))
+    category = data.get('category', category_str)
+
+    # 본문에 Picsum 이미지 삽입
+    content = build_content_with_images(content, topic.get('topic', title))
 
     print(f"  제목: {title}")
     print(f"  카테고리: {category}")
     print(f"  태그: {tags[:60]}")
-    print(f"  본문: {len(content)}자")
+    print(f"  본문: {len(content)}자 (이미지 포함)")
     return title, content, tags, category
 
 
@@ -455,8 +492,7 @@ def _select_category(page, category: str):
         print(f"  카테고리 선택 오류: {e}")
 
 
-def post_to_tistory(title: str, content: str, tags: str,
-                    category: str = "IT/개발", image_bytes: bytes | None = None):
+def post_to_tistory(title: str, content: str, tags: str, category: str = "IT/개발"):
     """Playwright로 티스토리에 공개 발행합니다."""
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -517,36 +553,6 @@ def post_to_tistory(title: str, content: str, tags: str,
         print(f"  본문 결과: {result}")
         time.sleep(1)
 
-        # 4b. 인라인 이미지 삽입 (첫 번째 h2 섹션 뒤)
-        if image_bytes:
-            print("  인라인 이미지 삽입...")
-            img_b64 = base64.b64encode(image_bytes).decode()
-            inserted = page.evaluate(
-                """
-                ([b64, alt]) => {
-                    const editor = tinymce.get(0) || tinymce.editors[0];
-                    if (!editor) return false;
-                    const imgHtml = '<p><img src="data:image/png;base64,' + b64
-                        + '" alt="' + alt + '" style="max-width:100%;height:auto;'
-                        + 'border-radius:8px;margin:16px 0;" /></p>';
-                    const body = editor.getDoc().body;
-                    const h2 = body.querySelector('h2');
-                    if (h2 && h2.nextSibling) {
-                        const tmp = document.createElement('div');
-                        tmp.innerHTML = imgHtml;
-                        h2.parentNode.insertBefore(tmp.firstChild, h2.nextSibling);
-                    } else {
-                        editor.insertContent(imgHtml);
-                    }
-                    editor.save();
-                    return true;
-                }
-                """,
-                [img_b64, title[:30]]
-            )
-            print(f"  인라인 이미지: {'삽입 완료' if inserted else '삽입 실패'}")
-            time.sleep(1)
-
         # 5. 카테고리 선택 (에디터 상단, 발행 패널 열기 전)
         if category:
             print("  카테고리 선택...")
@@ -576,40 +582,6 @@ def post_to_tistory(title: str, content: str, tags: str,
         """)
         time.sleep(1)
 
-        # 8b. 대표이미지(썸네일) 업로드
-        tmp_img_path = None
-        if image_bytes:
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                    f.write(image_bytes)
-                    tmp_img_path = f.name
-                print("  대표이미지 업로드 시도...")
-                # 대표이미지 영역 클릭 (다양한 선택자 시도)
-                clicked = False
-                for sel in [
-                    "label[for*='coverImage']", "label[for*='thumbnail']",
-                    ".cover-image-wrap", ".thumbnail-wrap",
-                    "button:has-text('대표이미지')", "[class*='coverImage']",
-                ]:
-                    els = page.locator(sel)
-                    if els.count() > 0:
-                        els.first().click()
-                        time.sleep(1.5)
-                        clicked = True
-                        break
-                if clicked:
-                    file_inputs = page.locator("input[type='file']").all()
-                    if file_inputs:
-                        file_inputs[-1].set_input_files(tmp_img_path)
-                        time.sleep(2)
-                        print("  대표이미지 업로드 완료")
-                    else:
-                        print("  대표이미지 파일 입력 없음")
-                else:
-                    print("  대표이미지 영역 없음, 스킵")
-            except Exception as e:
-                print(f"  대표이미지 업로드 오류: {e}")
-
         # 9. 발행 버튼 클릭
         btn_texts = [b.inner_text().strip() for b in page.locator("button").all()]
         print(f"  버튼: {[t for t in btn_texts if t and len(t) < 20]}")
@@ -635,11 +607,6 @@ def post_to_tistory(title: str, content: str, tags: str,
         final_url = page.url
         print(f"  발행 완료! URL: {final_url}")
         browser.close()
-
-        # 임시 이미지 파일 정리
-        if tmp_img_path and os.path.exists(tmp_img_path):
-            os.unlink(tmp_img_path)
-
         return final_url
 
 
@@ -689,12 +656,9 @@ if __name__ == "__main__":
             results.append({"topic": topic.get("topic"), "status": "생성실패", "url": None})
             continue
 
-        print(f"\n🖼️  Step 2c: 대표이미지 생성")
-        image_bytes = generate_topic_image(topic.get("topic", title))
-
         print(f"\n🚀 Step 3: 티스토리 포스팅")
         try:
-            url = post_to_tistory(title, content, tags, category, image_bytes=image_bytes)
+            url = post_to_tistory(title, content, tags, category)
             save_posted_topic(topic.get("topic", title))
             results.append({"topic": topic.get("topic"), "status": "발행완료", "url": url})
         except Exception as e:
