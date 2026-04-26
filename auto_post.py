@@ -287,20 +287,20 @@ def build_content_with_images(content_html: str, image_queries: list[str]) -> st
 
     result = []
     h2_count = 0
-    insert_at = {1, 3}  # 1번째, 3번째 h2 뒤에 삽입
+    # 모든 h2 섹션에 이미지 삽입 (image_queries가 충분하면), 최대 4개
     for part in parts:
         result.append(part)
         if re.match(r'<h2', part, re.IGNORECASE):
             h2_count += 1
-            if h2_count in insert_at and (h2_count - 1) < len(image_queries):
-                query = image_queries[h2_count - 1]
-                img_url = fetch_image_url(query)
-                alt = re.sub(r'<[^>]+>', '', part).strip()[:40]
-                result.append(
-                    f'<figure style="text-align:center;margin:20px 0 28px;">'
-                    f'<img src="{img_url}" alt="{alt}" '
-                    f'style="max-width:100%;border-radius:10px;" /></figure>\n'
-                )
+            # 쿼리 순환 사용: 쿼리 수보다 h2가 많으면 쿼리를 재활용
+            query = image_queries[(h2_count - 1) % len(image_queries)]
+            img_url = fetch_image_url(query)
+            alt = re.sub(r'<[^>]+>', '', part).strip()[:40]
+            result.append(
+                f'<figure style="text-align:center;margin:20px 0 28px;">'
+                f'<img src="{img_url}" alt="{alt}" '
+                f'style="max-width:100%;border-radius:10px;" /></figure>\n'
+            )
     return "".join(result)
 
 
@@ -330,22 +330,40 @@ def _parse_json(text: str) -> dict:
     m = re.search(r'\{[\s\S]*\}', text)
     if not m:
         raise ValueError(f"JSON 추출 실패:\n{text[:400]}")
+    raw = m.group()
     try:
-        return json.loads(m.group())
+        return json.loads(raw)
     except json.JSONDecodeError:
-        raw = m.group()
+        pass
+
+    # content 필드 안의 HTML을 별도 추출 후 재조립
+    try:
         title_m   = re.search(r'"title"\s*:\s*"([^"]*)"', raw)
+        # content: "..." 사이를 greedy로 추출 (tags 앞까지)
         content_m = re.search(r'"content"\s*:\s*"([\s\S]*?)"\s*,\s*"tags"', raw)
         tags_m    = re.search(r'"tags"\s*:\s*"([^"]*)"', raw)
+        cat_m     = re.search(r'"category"\s*:\s*"([^"]*)"', raw)
+        iq_m      = re.search(r'"image_queries"\s*:\s*(\[[^\]]*\])', raw)
+
         if title_m and content_m and tags_m:
+            content_str = content_m.group(1).replace('\\"', '"')
+            img_queries = []
+            if iq_m:
+                try:
+                    img_queries = json.loads(iq_m.group(1))
+                except Exception:
+                    pass
             return {
                 "title":         title_m.group(1),
-                "content":       content_m.group(1).replace('\\"', '"'),
+                "content":       content_str,
                 "tags":          tags_m.group(1),
-                "category":      "IT/개발",
-                "image_queries": [],
+                "category":      cat_m.group(1) if cat_m else "IT/개발",
+                "image_queries": img_queries,
             }
-        raise ValueError(f"JSON 파싱 실패:\n{raw[:400]}")
+    except Exception:
+        pass
+
+    raise ValueError(f"JSON 파싱 실패:\n{raw[:400]}")
 
 
 # ──────────────────────────────────────────────────
@@ -376,36 +394,36 @@ def analyze_topics(conv_texts: list[str], n: int = MAX_POSTS,
     # 비IT 카테고리를 최소 몇 개 요구할지 계산
     non_it_required = max(1, n - 1)  # IT계열은 최대 1개, 나머지는 비IT
 
-    prompt = f"""당신은 다양한 관심사를 가진 한국인 개발자의 블로그 편집장입니다.
-아래 대화 기록을 분석해 독립적인 블로그 포스트 주제 {n}개를 선정하세요.
+    prompt = f"""당신은 광고 수익과 트래픽을 최적화하는 블로그 편집장입니다.
+아래 대화 기록을 분석해 Google AdSense 수익과 검색 유입에 유리한 블로그 포스트 주제 {n}개를 선정하세요.
 
 [필수 조건 — 반드시 지킬 것]
 1. {n}개 모두 서로 다른 카테고리여야 합니다
 2. IT 관련 카테고리(IT/개발·IT/보안·IT/면접)는 합쳐서 최대 1개만 허용
-3. 나머지 {non_it_required}개는 반드시 비IT 카테고리(일상·여행·리뷰·스크랩북·사진)에서 선택
-4. 비IT 주제는 대화에서 직접 언급되지 않아도 됩니다 — 필자의 성격·라이프스타일에서 자유롭게 추론하세요
-   예) 개발자가 자동화 도구 만드는 것 → 효율 추구 성향 → "개발자의 생산성 루틴" (일상)
-   예) AI 음악 프로젝트 → 음악 취미 → 국내외 공연장·음악 여행 소재 (여행)
-   예) 영상 자동화 → 영화·OTT 관심 → 최근 본 영화 리뷰 (리뷰/영화)
-5. 순수 JSON 배열만 반환 (마크다운·설명 없이)
-6. 각 항목: {{"topic": "주제명(20자 이내)", "focus": "이 포스트에서 집중할 핵심 내용(100자 이내)", "category": "아래 목록 중 정확히 하나"}}
-7. 개인 이름, 회사명, 이메일, API 키, 비밀번호 등 개인·기밀 정보 관련 주제 금지{avoid_section}
+3. 나머지 {non_it_required}개는 비IT 카테고리(일상·여행·리뷰·스크랩북·사진)에서 선택
+4. AdSense CPC가 높고 검색량이 많은 주제를 우선 선택하세요
+   고수익 카테고리 예시: 재테크/투자, 여행 후기, 제품 리뷰, 육아, 건강, 맛집
+   고트래픽 주제 예시: "XX 후기", "XX 추천", "XX 비교", "XX 방법"
+5. 비IT 주제는 대화에서 직접 언급 없어도 됩니다 — 필자의 라이프스타일에서 자유롭게 추론하세요
+6. 순수 JSON 배열만 반환 (마크다운·설명 없이)
+7. 각 항목: {{"topic": "주제명(20자 이내)", "focus": "이 포스트에서 집중할 핵심 내용(100자 이내)", "category": "아래 목록 중 정확히 하나"}}
+8. 개인 이름, 회사명, 이메일, API 키, 비밀번호 등 개인·기밀 정보 관련 주제 금지{avoid_section}
 
-[카테고리 정의 — 경계를 엄격히 지킬 것]
+[카테고리 정의]
 {cat_list}
 
-카테고리별 기준:
-- IT/개발: 소스코드, 라이브러리, 프레임워크, 개발 도구, API 연동, 배포 기술 (웹 앱 배포도 여기)
-- IT/보안: 암호화, PKI, 인증서, 보안 취약점, 해킹 방어
-- IT/면접: 개발자 채용, 기술 면접 질문, 이력서·포트폴리오
-- 일상: 일상 에세이, 취미, 루틴, 감상, 개인 생각
-- 스크랩북/경제: 주식·부동산·재테크·경제 뉴스 (IT 배포 비용은 경제가 아닌 IT/개발)
-- 여행: 국내외 여행지, 숙박, 맛집, 여행 계획
-- 리뷰/잡화: 생활용품, 전자기기, 문구 등 구매 후기
-- 리뷰/영화: 영화·드라마·OTT 감상
-- 리뷰/놀이시설: 테마파크, 전시회, 공연
-- 리뷰/장난감: 피규어, 보드게임, 완구
-- 사진: 촬영 기법, 카메라 장비, 사진 작품 공유
+카테고리별 기준 및 고수익 주제 예시:
+- IT/개발: 소스코드, 라이브러리, 배포 기술 (최대 1개)
+- IT/보안: 암호화, PKI, 보안 취약점
+- IT/면접: 개발자 면접, 이력서 팁
+- 일상: 개발자 루틴, 생산성 도구, 취미 생활 → "직장인 재테크 루틴", "개발자 부업 방법"
+- 스크랩북/경제: 주식, 부동산, 재테크 → "ETF 투자 방법", "청약 당첨 전략" (CPC 높음)
+- 여행: 여행지 후기, 맛집, 숙박 → "XX 여행 코스", "항공권 싸게 사는 법"
+- 리뷰/잡화: 전자기기, 생활용품 → "XX 한달 사용 후기", "가성비 XX 추천"
+- 리뷰/영화: 최신 영화·드라마 → "XX 결말 해석", "OTT 추천 영화"
+- 리뷰/놀이시설: 테마파크, 전시회 → "롯데월드 어른 후기", "전시회 관람 팁"
+- 리뷰/장난감: 레고, 피규어, 보드게임 → "XX 구매 후기", "어른 취미 레고 추천"
+- 사진: 스마트폰 사진, 촬영 팁
 
 === 대화 내용 ===
 {combined}"""
@@ -475,14 +493,19 @@ def generate_blog_post(topic: dict, conv_texts: list[str]) -> tuple[str, str, st
 {{"title": "제목 (60자 이내)", "content": "HTML 본문 (h2/h3/p/ul/li/strong/em/code 태그, 최소 1500자, 큰따옴표 금지)", "tags": "태그1,태그2,...,태그10", "category": "{category_str}", "image_queries": ["섹션1 이미지 검색어(영어)", "섹션2 이미지 검색어(영어)"]}}
 
 image_queries 작성 기준:
-- 반드시 영어로 작성 (Wikipedia 직접 검색용)
-- Wikipedia 문서 제목 형식으로 작성할 것 (검색 정확도 최우선)
-  예) 리뷰/영화: "Arrival (film)", "Blade Runner 2049", "Interstellar (film)"
-  예) 여행: "Gyeongbokgung", "Jeju Island", "Bukchon Hanok Village"
-  예) IT/개발: "Python (programming language)", "Docker (software)", "Playwright (software)"
-  예) 일상: "Standing desk", "Mechanical keyboard", "Coffee"
-  예) 보안: "Public key infrastructure", "Hardware security module"
-- 2개 제공 (1번째 h2, 3번째 h2 뒤에 삽입)
+- 반드시 영어로 작성 (Wikimedia Commons + Wikipedia 검색용)
+- 최대한 구체적인 고유명사·공식 명칭으로 작성 (Wikipedia 문서 제목 형식 권장)
+- 카테고리별 예시:
+  리뷰/영화: "Parasite (film)", "Avengers Endgame", "Squid Game"
+  여행: "Gyeongbokgung", "Jeju Island", "Anfield", "Tokyo Shibuya crossing"
+  IT/개발: "Python (programming language)", "Docker (software)", "FastAPI"
+  일상: "Standing desk", "Mechanical keyboard", "Lo-fi hip hop"
+  재테크: "Stock market", "Exchange-traded fund", "Seoul apartment"
+  리뷰/잡화: "MacBook Pro", "Sony WH-1000XM5", "iPhone 15"
+  리뷰/놀이시설: "Lotte World", "Universal Studios Japan"
+- 4개 제공 (각 h2 섹션마다 1개씩 삽입)
+- 각 쿼리는 해당 섹션 내용과 직접 관련된 구체적 키워드여야 함 (일반 배경 이미지 금지)
+- 같은 쿼리 반복 금지, 섹션마다 다른 관점의 이미지 제공
 
 작성 지침:
 - 서론 → 본론(3~4섹션, 각 섹션은 <h2> 태그로 시작) → 결론 구조
@@ -723,37 +746,21 @@ def post_to_tistory(title: str, content: str, tags: str,
         time.sleep(1)
 
         # 8b. 대표이미지 업로드
+        # 구조: div.box_thumb > div.inner_box > input.inp_g[type=file]
         tmp_thumb = None
         if thumbnail_url:
             tmp_thumb = _download_image(thumbnail_url)
         if tmp_thumb:
             try:
                 print("  대표이미지 업로드 시도...")
-                # 발행 패널 내 대표이미지 영역 찾기
-                thumb_clicked = False
-                for sel in [
-                    "label[for*='coverImage']", "label[for*='thumbnail']",
-                    "label[for*='representImage']", ".cover-image-wrap",
-                    ".thumbnail-wrap", "[class*='coverImage'] button",
-                    "button:has-text('대표이미지')",
-                ]:
-                    els = page.locator(sel)
-                    if els.count() > 0:
-                        els.first().click()
-                        time.sleep(1.5)
-                        thumb_clicked = True
-                        break
-
-                if thumb_clicked:
-                    file_inputs = page.locator("input[type='file']").all()
-                    if file_inputs:
-                        file_inputs[-1].set_input_files(tmp_thumb)
-                        time.sleep(2)
-                        print("  대표이미지 업로드 완료")
-                    else:
-                        print("  대표이미지 file input 없음")
-                else:
-                    print("  대표이미지 영역 찾지 못함, 스킵")
+                # box_thumb 안의 file input에 직접 파일 설정 (클릭 불필요)
+                file_inp = page.locator(".box_thumb input[type='file']")
+                if file_inp.count() == 0:
+                    # fallback: 모든 file input 중 마지막
+                    file_inp = page.locator("input[type='file']").last
+                file_inp.set_input_files(tmp_thumb)
+                time.sleep(2)
+                print("  대표이미지 업로드 완료")
             except Exception as e:
                 print(f"  대표이미지 업로드 오류: {e}")
             finally:
