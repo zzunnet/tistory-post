@@ -12,8 +12,10 @@ import hashlib
 import json
 import re
 import time
+import urllib.parse
 from pathlib import Path
 from dotenv import load_dotenv
+import requests
 
 load_dotenv()  # .env 파일에서 키 로드
 
@@ -153,49 +155,152 @@ def save_posted_topic(topic: str):
 
 
 # ──────────────────────────────────────────────────
-# 이미지 URL 생성 (Picsum Photos — 무료, API 키 불필요)
+# 이미지 검색 (Wikipedia API → Picsum fallback)
 # ──────────────────────────────────────────────────
 def _picsum_url(keyword: str, width: int = 800, height: int = 420) -> str:
-    """키워드를 시드로 결정론적 Picsum 이미지 URL 반환."""
+    """키워드를 시드로 결정론적 Picsum 이미지 URL 반환 (fallback용)."""
     seed = int(hashlib.md5(keyword.encode()).hexdigest(), 16) % 1000
     return f"https://picsum.photos/seed/{seed}/{width}/{height}"
 
 
-def build_content_with_images(content_html: str, topic_keyword: str) -> str:
-    """본문 HTML의 각 <h2> 섹션 뒤에 Picsum 이미지를 삽입합니다."""
-    import hashlib as _hm
+def fetch_image_url(query: str) -> str:
+    """검색어로 Wikipedia/Wikimedia Commons에서 관련 이미지 URL을 가져옵니다.
+    우선순위: Commons 파일 → Wikipedia 직접 조회 → Wikipedia 검색 → Picsum
+    """
+    hdrs = {"User-Agent": "tistory-autopost/1.0"}
+    query_keywords = set(query.lower().split())
 
-    # h2 태그를 기준으로 분리
+    def _wiki_img_by_title(api_url: str, title: str) -> str | None:
+        """Wikipedia 문서 제목으로 대표 이미지 URL 반환 (리다이렉트 추적)."""
+        try:
+            r = requests.get(api_url, params={
+                "action": "query", "titles": title, "redirects": 1,
+                "prop": "pageimages", "pithumbsize": 800, "format": "json",
+            }, timeout=6, headers=hdrs)
+            for page in r.json().get("query", {}).get("pages", {}).values():
+                if page.get("pageid", -1) != -1:
+                    src = page.get("thumbnail", {}).get("source")
+                    if src:
+                        return src
+        except Exception:
+            pass
+        return None
+
+    def _commons_img(query: str) -> str | None:
+        """Wikimedia Commons 파일 검색으로 이미지 URL 반환."""
+        try:
+            r = requests.get("https://commons.wikimedia.org/w/api.php", params={
+                "action": "query", "list": "search",
+                "srsearch": query, "srnamespace": "6",  # 파일 네임스페이스
+                "srlimit": 5, "format": "json",
+            }, timeout=6, headers=hdrs)
+            results = r.json().get("query", {}).get("search", [])
+            if not results:
+                return None
+
+            # 관련성 정렬: 제목에 쿼리 키워드 많이 포함된 것 우선
+            sorted_r = sorted(
+                results,
+                key=lambda h: len(query_keywords & set(h["title"].lower().split())),
+                reverse=True
+            )
+
+            for hit in sorted_r:
+                file_title = hit["title"]
+                # 비미디어 파일 제외 (.pdf, .tiff, .ogg 등)
+                ext = file_title.rsplit(".", 1)[-1].lower()
+                if ext not in ("jpg", "jpeg", "png", "gif", "webp", "svg"):
+                    continue
+                r2 = requests.get("https://commons.wikimedia.org/w/api.php", params={
+                    "action": "query", "titles": file_title,
+                    "prop": "imageinfo", "iiprop": "url", "iiurlwidth": "800",
+                    "format": "json",
+                }, timeout=6, headers=hdrs)
+                for page in r2.json().get("query", {}).get("pages", {}).values():
+                    ii = page.get("imageinfo", [])
+                    if ii:
+                        url = ii[0].get("thumburl") or ii[0].get("url", "")
+                        if url and url.startswith("http"):
+                            return url
+        except Exception as e:
+            print(f"      Commons 검색 오류: {e}")
+        return None
+
+    # 1단계: Wikimedia Commons 파일 직접 검색 (영화 포스터, 로고 등)
+    src = _commons_img(query)
+    if src:
+        print(f"    이미지(Commons): {query[:30]} → {src[:70]}...")
+        return src
+
+    # 2단계: Wikipedia 문서 직접 조회 (정확한 제목)
+    for api_url in [
+        "https://en.wikipedia.org/w/api.php",
+        "https://ko.wikipedia.org/w/api.php",
+    ]:
+        try:
+            src = _wiki_img_by_title(api_url, query)
+            if src:
+                print(f"    이미지(Wikipedia 직접): {query[:30]} → {src[:70]}...")
+                return src
+
+            # 3단계: Wikipedia 검색 fallback
+            r = requests.get(api_url, params={
+                "action": "query", "list": "search",
+                "srsearch": query, "srlimit": 5, "format": "json",
+            }, timeout=6, headers=hdrs)
+            results = r.json().get("query", {}).get("search", [])
+            sorted_r = sorted(
+                results,
+                key=lambda h: len(query_keywords & set(h["title"].lower().split())),
+                reverse=True
+            )
+            for hit in sorted_r:
+                src = _wiki_img_by_title(api_url, hit["title"])
+                if src:
+                    print(f"    이미지(Wikipedia 검색): {hit['title'][:30]} → {src[:70]}...")
+                    return src
+        except Exception as e:
+            print(f"    Wikipedia 검색 오류 ({api_url.split('/')[2][:15]}): {e}")
+
+    # 최종 fallback: Picsum
+    url = _picsum_url(query)
+    print(f"    이미지 fallback (Picsum): {url}")
+    return url
+
+
+def build_content_with_images(content_html: str, image_queries: list[str]) -> str:
+    """본문 HTML의 h2 섹션 뒤에 image_queries에 맞는 이미지를 삽입합니다.
+    image_queries: Gemini가 제안한 섹션별 이미지 검색어 목록
+    """
     parts = re.split(r'(<h2[^>]*>.*?</h2>)', content_html, flags=re.IGNORECASE)
+    if not image_queries:
+        return content_html
+
+    # h2가 없으면 본문 앞에 첫 번째 이미지만 삽입
     if len(parts) <= 1:
-        # h2가 없으면 첫머리에만 삽입
-        img_url = _picsum_url(topic_keyword)
-        img_tag = (
+        img_url = fetch_image_url(image_queries[0])
+        return (
             f'<figure style="text-align:center;margin:24px 0;">'
-            f'<img src="{img_url}" alt="{topic_keyword}" '
-            f'style="max-width:100%;border-radius:10px;" />'
-            f'</figure>\n'
-        )
-        return img_tag + content_html
+            f'<img src="{img_url}" alt="{image_queries[0]}" '
+            f'style="max-width:100%;border-radius:10px;" /></figure>\n'
+        ) + content_html
 
     result = []
     h2_count = 0
+    insert_at = {1, 3}  # 1번째, 3번째 h2 뒤에 삽입
     for part in parts:
         result.append(part)
         if re.match(r'<h2', part, re.IGNORECASE):
             h2_count += 1
-            # 첫 번째와 세 번째 h2 뒤에만 이미지 삽입 (너무 많으면 지저분)
-            if h2_count in (1, 3):
-                seed_kw = f"{topic_keyword}-{h2_count}"
-                img_url = _picsum_url(seed_kw)
-                img_tag = (
+            if h2_count in insert_at and (h2_count - 1) < len(image_queries):
+                query = image_queries[h2_count - 1]
+                img_url = fetch_image_url(query)
+                alt = re.sub(r'<[^>]+>', '', part).strip()[:40]
+                result.append(
                     f'<figure style="text-align:center;margin:20px 0 28px;">'
-                    f'<img src="{img_url}" alt="{topic_keyword}" '
-                    f'style="max-width:100%;border-radius:10px;" />'
-                    f'</figure>\n'
+                    f'<img src="{img_url}" alt="{alt}" '
+                    f'style="max-width:100%;border-radius:10px;" /></figure>\n'
                 )
-                result.append(img_tag)
-
     return "".join(result)
 
 
@@ -234,10 +339,11 @@ def _parse_json(text: str) -> dict:
         tags_m    = re.search(r'"tags"\s*:\s*"([^"]*)"', raw)
         if title_m and content_m and tags_m:
             return {
-                "title":    title_m.group(1),
-                "content":  content_m.group(1).replace('\\"', '"'),
-                "tags":     tags_m.group(1),
-                "category": "IT/개발",
+                "title":         title_m.group(1),
+                "content":       content_m.group(1).replace('\\"', '"'),
+                "tags":          tags_m.group(1),
+                "category":      "IT/개발",
+                "image_queries": [],
             }
         raise ValueError(f"JSON 파싱 실패:\n{raw[:400]}")
 
@@ -366,7 +472,17 @@ def generate_blog_post(topic: dict, conv_texts: list[str]) -> tuple[str, str, st
 6. 실제 사람 이름, 이메일 주소, API 키, 비밀번호, 인증 토큰 등 개인정보·기밀정보 절대 포함 금지
 
 반환 형식:
-{{"title": "제목 (60자 이내)", "content": "HTML 본문 (h2/h3/p/ul/li/strong/em/code 태그, 최소 1500자, 큰따옴표 금지)", "tags": "태그1,태그2,...,태그10", "category": "{category_str}"}}
+{{"title": "제목 (60자 이내)", "content": "HTML 본문 (h2/h3/p/ul/li/strong/em/code 태그, 최소 1500자, 큰따옴표 금지)", "tags": "태그1,태그2,...,태그10", "category": "{category_str}", "image_queries": ["섹션1 이미지 검색어(영어)", "섹션2 이미지 검색어(영어)"]}}
+
+image_queries 작성 기준:
+- 반드시 영어로 작성 (Wikipedia 직접 검색용)
+- Wikipedia 문서 제목 형식으로 작성할 것 (검색 정확도 최우선)
+  예) 리뷰/영화: "Arrival (film)", "Blade Runner 2049", "Interstellar (film)"
+  예) 여행: "Gyeongbokgung", "Jeju Island", "Bukchon Hanok Village"
+  예) IT/개발: "Python (programming language)", "Docker (software)", "Playwright (software)"
+  예) 일상: "Standing desk", "Mechanical keyboard", "Coffee"
+  예) 보안: "Public key infrastructure", "Hardware security module"
+- 2개 제공 (1번째 h2, 3번째 h2 뒤에 삽입)
 
 작성 지침:
 - 서론 → 본론(3~4섹션, 각 섹션은 <h2> 태그로 시작) → 결론 구조
@@ -380,19 +496,27 @@ def generate_blog_post(topic: dict, conv_texts: list[str]) -> tuple[str, str, st
     text = _gemini_call(client, prompt)
     data = _parse_json(text)
 
-    title    = data['title']
-    content  = data['content']
-    tags     = data['tags']
-    category = data.get('category', category_str)
+    title         = data['title']
+    content       = data['content']
+    tags          = data['tags']
+    category      = data.get('category', category_str)
+    image_queries = data.get('image_queries') or []
 
-    # 본문에 Picsum 이미지 삽입
-    content = build_content_with_images(content, topic.get('topic', title))
+    # image_queries가 없으면 주제명으로 fallback
+    if not image_queries:
+        image_queries = [topic.get('topic', title), topic.get('topic', title) + " illustration"]
 
     print(f"  제목: {title}")
     print(f"  카테고리: {category}")
     print(f"  태그: {tags[:60]}")
+    print(f"  이미지 검색어: {image_queries}")
+
+    # 본문에 이미지 삽입
+    print(f"  이미지 검색 중...")
+    content = build_content_with_images(content, image_queries)
+
     print(f"  본문: {len(content)}자 (이미지 포함)")
-    return title, content, tags, category
+    return title, content, tags, category, image_queries
 
 
 # ──────────────────────────────────────────────────
@@ -492,7 +616,23 @@ def _select_category(page, category: str):
         print(f"  카테고리 선택 오류: {e}")
 
 
-def post_to_tistory(title: str, content: str, tags: str, category: str = "IT/개발"):
+def _download_image(url: str) -> str | None:
+    """URL에서 이미지를 임시 파일로 다운로드. 경로 반환, 실패 시 None."""
+    import tempfile
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent": "tistory-autopost/1.0"})
+        if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+            suffix = ".jpg" if "jpeg" in r.headers.get("content-type", "") else ".png"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+                f.write(r.content)
+                return f.name
+    except Exception as e:
+        print(f"    이미지 다운로드 실패: {e}")
+    return None
+
+
+def post_to_tistory(title: str, content: str, tags: str,
+                    category: str = "IT/개발", thumbnail_url: str | None = None):
     """Playwright로 티스토리에 공개 발행합니다."""
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -582,6 +722,45 @@ def post_to_tistory(title: str, content: str, tags: str, category: str = "IT/개
         """)
         time.sleep(1)
 
+        # 8b. 대표이미지 업로드
+        tmp_thumb = None
+        if thumbnail_url:
+            tmp_thumb = _download_image(thumbnail_url)
+        if tmp_thumb:
+            try:
+                print("  대표이미지 업로드 시도...")
+                # 발행 패널 내 대표이미지 영역 찾기
+                thumb_clicked = False
+                for sel in [
+                    "label[for*='coverImage']", "label[for*='thumbnail']",
+                    "label[for*='representImage']", ".cover-image-wrap",
+                    ".thumbnail-wrap", "[class*='coverImage'] button",
+                    "button:has-text('대표이미지')",
+                ]:
+                    els = page.locator(sel)
+                    if els.count() > 0:
+                        els.first().click()
+                        time.sleep(1.5)
+                        thumb_clicked = True
+                        break
+
+                if thumb_clicked:
+                    file_inputs = page.locator("input[type='file']").all()
+                    if file_inputs:
+                        file_inputs[-1].set_input_files(tmp_thumb)
+                        time.sleep(2)
+                        print("  대표이미지 업로드 완료")
+                    else:
+                        print("  대표이미지 file input 없음")
+                else:
+                    print("  대표이미지 영역 찾지 못함, 스킵")
+            except Exception as e:
+                print(f"  대표이미지 업로드 오류: {e}")
+            finally:
+                import os as _os
+                if _os.path.exists(tmp_thumb):
+                    _os.unlink(tmp_thumb)
+
         # 9. 발행 버튼 클릭
         btn_texts = [b.inner_text().strip() for b in page.locator("button").all()]
         print(f"  버튼: {[t for t in btn_texts if t and len(t) < 20]}")
@@ -650,15 +829,18 @@ if __name__ == "__main__":
 
         print(f"\n✍️  Step 2b: 포스트 생성")
         try:
-            title, content, tags, category = generate_blog_post(topic, conv_texts)
+            title, content, tags, category, image_queries = generate_blog_post(topic, conv_texts)
         except Exception as e:
             print(f"  ❌ 생성 실패: {e}")
             results.append({"topic": topic.get("topic"), "status": "생성실패", "url": None})
             continue
 
+        # 첫 번째 이미지 검색어로 대표이미지 URL 결정
+        thumbnail_url = fetch_image_url(image_queries[0]) if image_queries else None
+
         print(f"\n🚀 Step 3: 티스토리 포스팅")
         try:
-            url = post_to_tistory(title, content, tags, category)
+            url = post_to_tistory(title, content, tags, category, thumbnail_url=thumbnail_url)
             save_posted_topic(topic.get("topic", title))
             results.append({"topic": topic.get("topic"), "status": "발행완료", "url": url})
         except Exception as e:
