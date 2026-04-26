@@ -13,3 +13,6 @@ __pycache__/
 
 # Environment
 .env
+
+# Runtime data
+posted_topics.json

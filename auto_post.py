@@ -7,9 +7,11 @@ import sys
 sys.stdout.reconfigure(encoding='utf-8')
 
 import os
+import base64
 import glob
 import json
 import re
+import tempfile
 import time
 from pathlib import Path
 from dotenv import load_dotenv
@@ -25,12 +27,23 @@ from playwright.sync_api import sync_playwright
 KAKAO_EMAIL    = os.environ["KAKAO_EMAIL"]
 KAKAO_PASSWORD = os.environ["KAKAO_PASSWORD"]
 BLOG_NAME      = "zzun"                 # zzun.tistory.com
-CATEGORY       = "IT / 보안"           # 티스토리 카테고리 (상위 / 하위)
+DEFAULT_CATEGORY = "IT/개발"           # 카테고리 미결정 시 기본값
+
+# 블로그에 실제 존재하는 카테고리 목록 (자동 선택에 활용)
+BLOG_CATEGORIES = [
+    "IT/개발", "IT/보안", "IT/면접",
+    "일상",
+    "스크랩북/경제",
+    "여행",
+    "리뷰/잡화", "리뷰/놀이시설", "리뷰/영화", "리뷰/장난감",
+    "사진",
+]
 
 MAX_SESSIONS        = 5    # 참고할 최근 Claude 세션 수
 MAX_MSG_PER_SESSION = 30   # 세션당 최대 메시지 수
 MAX_GEMINI_SESSIONS = 5    # 참고할 최근 Gemini 세션 수
 MAX_POSTS           = 3    # 1회 실행 시 발행할 포스트 수
+POSTED_LOG_FILE     = "posted_topics.json"   # 발행 기록 파일
 # ─────────────────────────────────────────
 
 
@@ -117,6 +130,67 @@ def get_gemini_conversations() -> list[str]:
 
 
 # ──────────────────────────────────────────────────
+# 발행 기록 관리 (중복 방지)
+# ──────────────────────────────────────────────────
+def load_posted_topics() -> list[str]:
+    """이전에 발행된 주제 목록을 불러옵니다."""
+    if os.path.exists(POSTED_LOG_FILE):
+        try:
+            return json.loads(Path(POSTED_LOG_FILE).read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def save_posted_topic(topic: str):
+    """발행된 주제를 기록합니다 (최근 100개 유지)."""
+    topics = load_posted_topics()
+    if topic not in topics:
+        topics.append(topic)
+    Path(POSTED_LOG_FILE).write_text(
+        json.dumps(topics[-100:], ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+
+# ──────────────────────────────────────────────────
+# 이미지 생성 (Gemini Imagen)
+# ──────────────────────────────────────────────────
+def generate_topic_image(topic_keyword: str) -> bytes | None:
+    """Gemini Imagen으로 주제 관련 이미지를 생성합니다. 실패 시 None 반환."""
+    try:
+        from google.genai import types as gtypes
+        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        prompt = (
+            f"Professional blog cover illustration for the topic: {topic_keyword}. "
+            "Modern minimalist flat design, no text, clean composition, "
+            "vibrant yet professional color palette, high quality digital art."
+        )
+        imagen_models = [
+            "imagen-4.0-fast-generate-001",
+            "imagen-4.0-generate-001",
+        ]
+        for model_name in imagen_models:
+            try:
+                response = client.models.generate_images(
+                    model=model_name,
+                    prompt=prompt,
+                    config=gtypes.GenerateImagesConfig(number_of_images=1, aspect_ratio="16:9"),
+                )
+                img_bytes = response.generated_images[0].image.image_bytes
+                print(f"  이미지 생성 완료 ({model_name}): {len(img_bytes):,} bytes")
+                return img_bytes
+            except Exception as e:
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or "quota" in str(e).lower():
+                    print(f"  {model_name} quota 소진, 다음 시도...")
+                    continue
+                raise
+    except Exception as e:
+        print(f"  이미지 생성 실패 ({type(e).__name__}): {e}")
+    return None
+
+
+# ──────────────────────────────────────────────────
 # 공통: Gemini 호출 헬퍼
 # ──────────────────────────────────────────────────
 def _gemini_call(client, prompt: str) -> str:
@@ -162,8 +236,10 @@ def _parse_json(text: str) -> dict:
 # ──────────────────────────────────────────────────
 # Step 2a. 대화에서 독립 주제 목록 추출
 # ──────────────────────────────────────────────────
-def analyze_topics(conv_texts: list[str], n: int = MAX_POSTS) -> list[dict]:
+def analyze_topics(conv_texts: list[str], n: int = MAX_POSTS,
+                   previously_posted: list[str] | None = None) -> list[dict]:
     """대화 전체를 분석해 블로그 포스트로 쓸 만한 독립 주제 n개를 반환합니다.
+    previously_posted: 이미 발행된 주제 목록 (유사 주제 제외용)
     반환: [{"topic": "...", "focus": "...", "category": "IT/개발|IT/보안"}, ...]
     """
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
@@ -172,18 +248,38 @@ def analyze_topics(conv_texts: list[str], n: int = MAX_POSTS) -> list[dict]:
     if len(combined) > 18000:
         combined = combined[:18000] + "\n\n...(이하 생략)"
 
-    prompt = f"""당신은 IT 기술 블로그 편집장입니다.
-아래 대화 기록을 읽고, 각각 독립적인 블로그 포스트로 쓸 수 있는 기술 주제를 정확히 {n}개 추출하세요.
+    avoid_section = ""
+    if previously_posted:
+        avoid_list = "\n".join(f"- {t}" for t in previously_posted[-30:])
+        avoid_section = f"""
+이미 포스팅된 주제 (이것과 유사하거나 겹치는 주제는 절대 선택 금지):
+{avoid_list}
+"""
+
+    cat_list = "\n".join(f"- {c}" for c in BLOG_CATEGORIES)
+    prompt = f"""당신은 블로그 편집장입니다.
+아래 대화 기록을 읽고, 각각 독립적인 블로그 포스트로 쓸 수 있는 주제를 정확히 {n}개 추출하세요.
 
 규칙:
-1. 주제는 서로 완전히 다른 영역이어야 합니다 (중복 금지)
-2. 대화에서 실제로 다룬 내용 기반 (추측 금지)
-3. 순수 JSON 배열만 반환 (마크다운·설명 없이)
-4. 각 항목: {{"topic": "주제명(20자 이내)", "focus": "이 포스트에서 집중할 핵심 내용(100자 이내)", "category": "IT/개발 또는 IT/보안"}}
+1. {n}개의 주제는 반드시 서로 다른 카테고리여야 합니다 — 같은 카테고리 반복 절대 금지
+2. 특히 IT/개발 카테고리는 최대 1개만 허용
+3. 대화 내용뿐 아니라 대화에서 추론할 수 있는 필자의 관심사, 경험, 라이프스타일도 주제로 활용 가능
+4. 순수 JSON 배열만 반환 (마크다운·설명 없이)
+5. 각 항목: {{"topic": "주제명(20자 이내)", "focus": "이 포스트에서 집중할 핵심 내용(100자 이내)", "category": "아래 목록 중 정확히 하나"}}
+6. 개인 이름, 회사명, 이메일, API 키, 비밀번호 등 개인·기밀 정보 관련 주제 금지{avoid_section}
 
-카테고리:
-- IT/보안: 암호화, PQC, HSM, PKI, 인증서, 보안 취약점, 금융보안
-- IT/개발: 프로그래밍, 자동화, 웹개발, 디버깅, 라이브러리, API, 도구
+선택 가능한 카테고리 (이 목록에서만 골라야 함):
+{cat_list}
+
+카테고리 선택 기준 및 예시 주제:
+- IT/개발: 프로그래밍, 자동화, 웹개발, 라이브러리, API — 최대 1개만
+- IT/보안: 암호화, PQC, HSM, PKI, 인증서, 보안 취약점
+- IT/면접: 개발자 면접 질문, 기술 역량, 이력서 팁
+- 일상: 개발자의 일상, 워라밸, 생산성, 사용하는 도구 이야기
+- 스크랩북/경제: IT 업계 경제 동향, 재테크, 투자
+- 여행: 여행 경험·계획, 국내외 관광지
+- 리뷰/잡화·리뷰/영화 등: 사용하는 장비, 최근 본 영화, 구매 후기
+- 사진: 촬영 기법, 장비 리뷰, 사진 작품
 
 === 대화 내용 ===
 {combined}"""
@@ -233,6 +329,7 @@ def generate_blog_post(topic: dict, conv_texts: list[str]) -> tuple[str, str, st
 3. content 필드의 HTML 안에서 역슬래시(\\) 사용 금지
 4. JSON 이외의 텍스트 일절 없이
 5. 위 주제 외 다른 주제 내용 포함 금지
+6. 실제 사람 이름, 회사명, 이메일 주소, API 키, 비밀번호, 인증 토큰 등 개인정보·기밀정보 절대 포함 금지
 
 반환 형식:
 {{"title": "제목 (60자 이내)", "content": "HTML 본문 (h2/h3/p/ul/li/strong/em/code 태그, 최소 1500자, 큰따옴표 금지)", "tags": "태그1,태그2,...,태그10", "category": "{topic.get('category', 'IT/개발')}"}}
@@ -302,10 +399,14 @@ def _login(page, blog_name: str, email: str, password: str):
 
 def _select_category(page, category: str):
     """에디터 상단 카테고리 드롭다운에서 카테고리를 선택합니다.
-    티스토리: 상위='IT', 하위='- 보안' (대시+공백 접두사)
+    티스토리 드롭다운 구조:
+      - 상위 카테고리: aria-label="IT"
+      - 하위 카테고리: aria-label="- 보안"  (대시+공백 접두사)
+    "IT/보안" → 먼저 "- 보안" 시도, 실패 시 "IT" 시도
+    "일상" → "일상" 직접 시도
     """
     try:
-        # 에디터 상단 카테고리 버튼 — 버튼 목록에서 "카테고리" 포함된 첫 버튼
+        # 카테고리 버튼 찾기
         cat_btn = None
         for btn in page.locator("button").all():
             try:
@@ -321,33 +422,41 @@ def _select_category(page, category: str):
         cat_btn.click()
         time.sleep(1.5)
 
-        # 드롭다운: div[role="option"][aria-label="..."] 구조
-        # 하위 카테고리("- 보안")가 이미 목록에 있으므로 바로 클릭
-        # "IT/보안" → label = "- 보안"
         parts = [p.strip() for p in category.split("/")]
+        # 시도할 aria-label 후보: 하위 → 상위 → 전체명 순
         if len(parts) >= 2:
-            label = f"- {parts[1]}"
+            candidates = [f"- {parts[1]}", parts[1], parts[0], category]
         else:
-            label = parts[0]
+            candidates = [parts[0]]
 
-        clicked = page.evaluate(f"""
-            () => {{
-                const el = document.querySelector('[role="option"][aria-label="{label}"]');
-                if (el) {{ el.click(); return true; }}
-                return false;
-            }}
-        """)
+        clicked_label = None
+        for label in candidates:
+            clicked = page.evaluate(
+                """
+                (label) => {
+                    const el = document.querySelector('[role="option"][aria-label="' + label + '"]');
+                    if (el) { el.click(); return true; }
+                    return false;
+                }
+                """,
+                label
+            )
+            if clicked:
+                clicked_label = label
+                break
+
         time.sleep(0.5)
-        if clicked:
-            print(f"  카테고리 선택: '{label}'")
+        if clicked_label:
+            print(f"  카테고리 선택: '{clicked_label}'")
         else:
-            print(f"  카테고리 항목 없음: '{label}'")
+            print(f"  카테고리 항목 없음: '{category}' (후보: {candidates})")
 
     except Exception as e:
         print(f"  카테고리 선택 오류: {e}")
 
 
-def post_to_tistory(title: str, content: str, tags: str, category: str = CATEGORY):
+def post_to_tistory(title: str, content: str, tags: str,
+                    category: str = "IT/개발", image_bytes: bytes | None = None):
     """Playwright로 티스토리에 공개 발행합니다."""
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -408,6 +517,36 @@ def post_to_tistory(title: str, content: str, tags: str, category: str = CATEGOR
         print(f"  본문 결과: {result}")
         time.sleep(1)
 
+        # 4b. 인라인 이미지 삽입 (첫 번째 h2 섹션 뒤)
+        if image_bytes:
+            print("  인라인 이미지 삽입...")
+            img_b64 = base64.b64encode(image_bytes).decode()
+            inserted = page.evaluate(
+                """
+                ([b64, alt]) => {
+                    const editor = tinymce.get(0) || tinymce.editors[0];
+                    if (!editor) return false;
+                    const imgHtml = '<p><img src="data:image/png;base64,' + b64
+                        + '" alt="' + alt + '" style="max-width:100%;height:auto;'
+                        + 'border-radius:8px;margin:16px 0;" /></p>';
+                    const body = editor.getDoc().body;
+                    const h2 = body.querySelector('h2');
+                    if (h2 && h2.nextSibling) {
+                        const tmp = document.createElement('div');
+                        tmp.innerHTML = imgHtml;
+                        h2.parentNode.insertBefore(tmp.firstChild, h2.nextSibling);
+                    } else {
+                        editor.insertContent(imgHtml);
+                    }
+                    editor.save();
+                    return true;
+                }
+                """,
+                [img_b64, title[:30]]
+            )
+            print(f"  인라인 이미지: {'삽입 완료' if inserted else '삽입 실패'}")
+            time.sleep(1)
+
         # 5. 카테고리 선택 (에디터 상단, 발행 패널 열기 전)
         if category:
             print("  카테고리 선택...")
@@ -437,6 +576,40 @@ def post_to_tistory(title: str, content: str, tags: str, category: str = CATEGOR
         """)
         time.sleep(1)
 
+        # 8b. 대표이미지(썸네일) 업로드
+        tmp_img_path = None
+        if image_bytes:
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                    f.write(image_bytes)
+                    tmp_img_path = f.name
+                print("  대표이미지 업로드 시도...")
+                # 대표이미지 영역 클릭 (다양한 선택자 시도)
+                clicked = False
+                for sel in [
+                    "label[for*='coverImage']", "label[for*='thumbnail']",
+                    ".cover-image-wrap", ".thumbnail-wrap",
+                    "button:has-text('대표이미지')", "[class*='coverImage']",
+                ]:
+                    els = page.locator(sel)
+                    if els.count() > 0:
+                        els.first().click()
+                        time.sleep(1.5)
+                        clicked = True
+                        break
+                if clicked:
+                    file_inputs = page.locator("input[type='file']").all()
+                    if file_inputs:
+                        file_inputs[-1].set_input_files(tmp_img_path)
+                        time.sleep(2)
+                        print("  대표이미지 업로드 완료")
+                    else:
+                        print("  대표이미지 파일 입력 없음")
+                else:
+                    print("  대표이미지 영역 없음, 스킵")
+            except Exception as e:
+                print(f"  대표이미지 업로드 오류: {e}")
+
         # 9. 발행 버튼 클릭
         btn_texts = [b.inner_text().strip() for b in page.locator("button").all()]
         print(f"  버튼: {[t for t in btn_texts if t and len(t) < 20]}")
@@ -462,6 +635,11 @@ def post_to_tistory(title: str, content: str, tags: str, category: str = CATEGOR
         final_url = page.url
         print(f"  발행 완료! URL: {final_url}")
         browser.close()
+
+        # 임시 이미지 파일 정리
+        if tmp_img_path and os.path.exists(tmp_img_path):
+            os.unlink(tmp_img_path)
+
         return final_url
 
 
@@ -491,9 +669,10 @@ if __name__ == "__main__":
 
     print(f"\n  총 수집 블록: {len(conv_texts)}개 (Claude + Gemini)")
 
-    # Step 2a: 주제 목록 추출
-    print(f"\n🔍 Step 2a: 주제 분석 ({MAX_POSTS}개 추출)")
-    topics = analyze_topics(conv_texts, n=MAX_POSTS)
+    # Step 2a: 주제 목록 추출 (이전 발행 주제 중복 제외)
+    posted_topics = load_posted_topics()
+    print(f"\n🔍 Step 2a: 주제 분석 ({MAX_POSTS}개 추출, 기발행 {len(posted_topics)}개 제외)")
+    topics = analyze_topics(conv_texts, n=MAX_POSTS, previously_posted=posted_topics)
 
     # Step 2b + 3: 주제별 포스트 생성 & 발행
     results = []
@@ -510,9 +689,13 @@ if __name__ == "__main__":
             results.append({"topic": topic.get("topic"), "status": "생성실패", "url": None})
             continue
 
+        print(f"\n🖼️  Step 2c: 대표이미지 생성")
+        image_bytes = generate_topic_image(topic.get("topic", title))
+
         print(f"\n🚀 Step 3: 티스토리 포스팅")
         try:
-            url = post_to_tistory(title, content, tags, category)
+            url = post_to_tistory(title, content, tags, category, image_bytes=image_bytes)
+            save_posted_topic(topic.get("topic", title))
             results.append({"topic": topic.get("topic"), "status": "발행완료", "url": url})
         except Exception as e:
             print(f"  ❌ 포스팅 실패: {e}")
