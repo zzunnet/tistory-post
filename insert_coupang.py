@@ -271,13 +271,13 @@ def get_products_for_post(category: str, title: str) -> list[dict]:
 def build_coupang_html(products: list[dict]) -> str:
     items_html = ""
     for product in products[:3]:
-        search_url = (
-            "https://www.coupang.com/np/search?q="
-            + urllib.parse.quote(product["query"])
-        )
+        # 검색어 인코딩 (한글/공백만 인코딩, %는 safe로 두어 이중인코딩 방지)
+        q = urllib.parse.quote(product["query"])          # 한글·공백 → %XX
+        inner_url = f"https://www.coupang.com/np/search?q={q}"
+        # url= 파라미터: 구조 문자(?=:/)도 인코딩하되 이미 인코딩된 %XX는 재인코딩하지 않음
         link_url = (
             f"https://link.coupang.com/a/{COUPANG_ID}"
-            f"?url={urllib.parse.quote(search_url)}"
+            f"?url={urllib.parse.quote(inner_url, safe='%')}"
         )
         items_html += (
             f"<li style='margin:8px 0;'>"
@@ -352,7 +352,9 @@ def process_post(page, post: dict) -> str:
         print(f"    에디터 인스턴스 접근 실패")
         return "failed:editor_not_accessible"
 
-    if check.get("has_coupang"):
+    fix_mode = post.get("_fix", False)
+
+    if check.get("has_coupang") and not fix_mode:
         print(f"    이미 쿠팡 링크 포함 → 스킵")
         return "skipped:already_has_coupang"
 
@@ -364,6 +366,21 @@ def process_post(page, post: dict) -> str:
 
     # 기존 본문 읽기 후 쿠팡 섹션 추가 (auto_post.py 동일 이스케이프)
     new_content = page.evaluate("""
+        () => {
+            const editor = tinymce.get(0) || tinymce.editors[0];
+            if (!editor) return '';
+            let content = editor.getContent();
+            // --fix 모드: 기존 쿠팡 div 제거 (link.coupang.com 포함 div)
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(content, 'text/html');
+            doc.querySelectorAll('div').forEach(div => {
+                if (div.innerHTML.includes('link.coupang.com')) {
+                    div.remove();
+                }
+            });
+            return doc.body.innerHTML;
+        }
+    """) if fix_mode else page.evaluate("""
         () => {
             const editor = tinymce.get(0) || tinymce.editors[0];
             return editor ? editor.getContent() : '';
@@ -440,6 +457,7 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--test", type=int, metavar="N", help="N개만 테스트")
     group.add_argument("--all",  action="store_true",   help="전체 글 처리")
+    group.add_argument("--fix",  type=int, metavar="N", help="이미 쿠팡 링크가 있는 글 N개를 올바른 URL로 교체")
     args = parser.parse_args()
 
     print("=" * 55)
@@ -473,8 +491,7 @@ def main():
 
         # ── Step 2: 글 목록 수집 ────────────────────
         print("\n📋 Step 2: 글 목록 수집")
-        # 테스트 모드는 최대 2페이지(30개)만 수집
-        max_pages = 2 if args.test else 100
+        max_pages = 2 if (args.test or args.fix) else 100
         all_posts = collect_posts(page, max_pages=max_pages)
 
         if not all_posts:
@@ -482,22 +499,28 @@ def main():
             browser.close()
             return
 
-        # 이미 완료된 글 제외
-        DONE_STATUSES = {"done", "skipped:already_has_coupang"}
-        todo_posts = [
-            post for post in all_posts
-            if post["id"] not in processed
-            or processed[post["id"]].get("status") not in DONE_STATUSES
-        ]
-
-        if args.test:
-            todo_posts = todo_posts[: args.test]
-            print(f"\n  [테스트 모드] {len(todo_posts)}개 처리")
+        if args.fix:
+            # --fix: 이미 쿠팡 링크가 있는 글만 대상, _fix 플래그 설정
+            todo_posts = all_posts[: args.fix]
+            for p in todo_posts:
+                p["_fix"] = True
+            print(f"\n  [수정 모드] {len(todo_posts)}개 쿠팡 링크 교체")
         else:
-            print(
-                f"\n  [전체 모드] {len(todo_posts)}개 처리 "
-                f"(전체 {len(all_posts)}개 중 미처리)"
-            )
+            # 이미 완료된 글 제외
+            DONE_STATUSES = {"done", "skipped:already_has_coupang"}
+            todo_posts = [
+                post for post in all_posts
+                if post["id"] not in processed
+                or processed[post["id"]].get("status") not in DONE_STATUSES
+            ]
+            if args.test:
+                todo_posts = todo_posts[: args.test]
+                print(f"\n  [테스트 모드] {len(todo_posts)}개 처리")
+            else:
+                print(
+                    f"\n  [전체 모드] {len(todo_posts)}개 처리 "
+                    f"(전체 {len(all_posts)}개 중 미처리)"
+                )
 
         if not todo_posts:
             print("  처리할 글이 없습니다.")
