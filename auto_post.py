@@ -40,6 +40,7 @@ BLOG_CATEGORIES = [
     "사진",
 ]
 
+COUPANG_ID          = "AF5718399"   # 쿠팡 파트너스 ID
 MAX_SESSIONS        = 5    # 참고할 최근 Claude 세션 수
 MAX_MSG_PER_SESSION = 30   # 세션당 최대 메시지 수
 MAX_GEMINI_SESSIONS = 5    # 참고할 최근 Gemini 세션 수
@@ -343,6 +344,43 @@ def build_content_with_images(content_html: str, image_queries: list[str]) -> st
 
 
 # ──────────────────────────────────────────────────
+# 쿠팡 파트너스 링크 섹션 생성
+# ──────────────────────────────────────────────────
+def build_coupang_section(products: list[dict]) -> str:
+    """Gemini가 선정한 product_queries로 쿠팡 파트너스 링크 HTML 생성."""
+    items_html = ""
+    for product in products[:3]:
+        q = urllib.parse.quote(product.get("query", ""))
+        link_url = (
+            f"https://www.coupang.com/np/search?q={q}"
+            f"&affiliate_id={COUPANG_ID}"
+        )
+        name = product.get("name", product.get("query", ""))
+        items_html += (
+            f"<li style='margin:8px 0;'>"
+            f"<a href='{link_url}' target='_blank' rel='noopener sponsored' "
+            f"style='color:#e85c0d;text-decoration:none;font-weight:bold;'>"
+            f"&#128722; {name}"
+            f"</a>"
+            f"<span style='font-size:12px;color:#999;'> &mdash; 쿠팡에서 확인하기</span>"
+            f"</li>"
+        )
+    disclaimer = (
+        "이 포스팅은 쿠팡 파트너스 활동의 일환으로, "
+        "이에 따른 일정액의 수수료를 제공받습니다."
+    )
+    return (
+        "<div style='margin:40px 0 20px;padding:20px 24px;"
+        "border-left:5px solid #e85c0d;background:#fff8f5;"
+        "border-radius:4px;'>"
+        "<h4 style='margin:0 0 12px;color:#e85c0d;font-size:16px;'>&#128722; 관련 상품</h4>"
+        f"<ul style='margin:0;padding:0 0 0 4px;list-style:none;'>{items_html}</ul>"
+        f"<p style='margin:14px 0 0;font-size:11px;color:#bbb;'>{disclaimer}</p>"
+        "</div>"
+    )
+
+
+# ──────────────────────────────────────────────────
 # 공통: Gemini 호출 헬퍼
 # ──────────────────────────────────────────────────
 def _claude_fallback_call(prompt: str) -> str:
@@ -413,6 +451,7 @@ def _parse_json(text: str) -> dict:
         tags_m    = re.search(r'"tags"\s*:\s*"([^"]*)"', raw)
         cat_m     = re.search(r'"category"\s*:\s*"([^"]*)"', raw)
         iq_m      = re.search(r'"image_queries"\s*:\s*(\[[^\]]*\])', raw)
+        pq_m      = re.search(r'"product_queries"\s*:\s*(\[[\s\S]*?\])', raw)
 
         if title_m and content_m and tags_m:
             content_str = content_m.group(1).replace('\\"', '"')
@@ -422,12 +461,19 @@ def _parse_json(text: str) -> dict:
                     img_queries = json.loads(iq_m.group(1))
                 except Exception:
                     pass
+            prod_queries = []
+            if pq_m:
+                try:
+                    prod_queries = json.loads(pq_m.group(1))
+                except Exception:
+                    pass
             return {
-                "title":         title_m.group(1),
-                "content":       content_str,
-                "tags":          tags_m.group(1),
-                "category":      cat_m.group(1) if cat_m else "IT/개발",
-                "image_queries": img_queries,
+                "title":           title_m.group(1),
+                "content":         content_str,
+                "tags":            tags_m.group(1),
+                "category":        cat_m.group(1) if cat_m else "IT/개발",
+                "image_queries":   img_queries,
+                "product_queries": prod_queries,
             }
     except Exception:
         pass
@@ -559,7 +605,7 @@ def generate_blog_post(topic: dict, conv_texts: list[str]) -> tuple[str, str, st
 6. 실제 사람 이름, 이메일 주소, API 키, 비밀번호, 인증 토큰 등 개인정보·기밀정보 절대 포함 금지
 
 반환 형식:
-{{"title": "제목 (60자 이내)", "content": "HTML 본문 (h2/h3/p/ul/li/strong/em/code 태그, 최소 1500자, 큰따옴표 금지)", "tags": "태그1,태그2,...,태그10", "category": "{category_str}", "image_queries": ["섹션1 이미지 검색어(영어)", "섹션2 이미지 검색어(영어)"]}}
+{{"title": "제목 (60자 이내)", "content": "HTML 본문 (h2/h3/p/ul/li/strong/em/code 태그, 최소 1500자, 큰따옴표 금지)", "tags": "태그1,태그2,...,태그10", "category": "{category_str}", "image_queries": ["섹션1 이미지 검색어(영어)", "섹션2 이미지 검색어(영어)"], "product_queries": [{{"name": "상품명(15자 이내)", "query": "쿠팡 검색어"}}, {{"name": "상품명(15자 이내)", "query": "쿠팡 검색어"}}, {{"name": "상품명(15자 이내)", "query": "쿠팡 검색어"}}]}}
 
 image_queries 작성 기준:
 - 반드시 영어로 작성 (Wikimedia Commons + Wikipedia + Unsplash 검색용)
@@ -587,6 +633,16 @@ image_queries 작성 기준:
 - 각 쿼리는 해당 섹션 내용과 직접 관련된 키워드여야 함
 - 같은 쿼리 반복 금지, 섹션마다 다른 관점의 이미지 제공
 
+product_queries 작성 기준:
+- 이 글을 읽은 독자가 실제로 살 법한 상품 3개 (쿠팡 검색어 기준)
+- 글 내용과 직접 연관된 것 우선
+- 예시:
+  Python 크롤링 글 → "파이썬 책 추천", "개발자용 노트북 스탠드", "코딩 마우스"
+  여행 글 → "기내 반입 캐리어", "여행용 보조배터리", "목베개"
+  영화 리뷰 → "미니 빔프로젝터", "홈시어터 사운드바", "팝콘 메이커"
+  재테크 글 → "재테크 책 추천", "가계부 다이어리", "전자책 리더기"
+- name은 15자 이내 한국어, query는 쿠팡 실제 검색어(한국어)
+
 작성 지침:
 - 서론 → 본론(3~4섹션, 각 섹션은 <h2> 태그로 시작) → 결론 구조
 - 카테고리 {category_str}에 어울리는 톤과 내용 (IT 카테고리면 기술적, 여행/일상이면 감성적·실용적)
@@ -599,11 +655,12 @@ image_queries 작성 기준:
     text = _gemini_call(client, prompt)
     data = _parse_json(text)
 
-    title         = data['title']
-    content       = data['content']
-    tags          = data['tags']
-    category      = data.get('category', category_str)
-    image_queries = data.get('image_queries') or []
+    title          = data['title']
+    content        = data['content']
+    tags           = data['tags']
+    category       = data.get('category', category_str)
+    image_queries  = data.get('image_queries') or []
+    product_queries = data.get('product_queries') or []
 
     # image_queries가 없으면 주제명으로 fallback
     if not image_queries:
@@ -613,12 +670,17 @@ image_queries 작성 기준:
     print(f"  카테고리: {category}")
     print(f"  태그: {tags[:60]}")
     print(f"  이미지 검색어: {image_queries}")
+    print(f"  쿠팡 상품: {[p.get('name') for p in product_queries]}")
 
     # 본문에 이미지 삽입
     print(f"  이미지 검색 중...")
     content = build_content_with_images(content, image_queries)
 
-    print(f"  본문: {len(content)}자 (이미지 포함)")
+    # 본문 끝에 쿠팡 파트너스 섹션 추가
+    if product_queries:
+        content += build_coupang_section(product_queries)
+
+    print(f"  본문: {len(content)}자 (이미지+쿠팡 포함)")
     return title, content, tags, category, image_queries
 
 
