@@ -29,6 +29,9 @@ BLOG_NAME      = "zzun"                        # 관리자 URL: zzun.tistory.com
 BLOG_DOMAIN    = "zzun.net"                    # 공개 도메인 (커스텀)
 COUPANG_ID     = "AF5718399"
 PROCESSED_FILE = "processed_posts.json"
+LINKS_FILE     = "coupang_links.json"
+
+_CACHED_LINKS: dict = {}
 
 BLOG_CATEGORIES = [
     "IT/개발", "IT/보안", "IT/면접",
@@ -112,6 +115,28 @@ KEYWORD_CATEGORY_MAP = {
     "리뷰/놀이시설":    ["놀이공원", "테마파크", "전시회", "아쿠아리움", "키즈카페"],
     "일상":             ["일상", "루틴", "생산성", "독서", "카페", "취미"],
 }
+
+
+# ─────────────────────────────────────────
+# coupang_links.json 관리
+# ─────────────────────────────────────────
+def load_coupang_links() -> dict:
+    if os.path.exists(LINKS_FILE):
+        try:
+            return json.loads(Path(LINKS_FILE).read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _get_product_url(query: str) -> str:
+    """캐시된 단축 링크 반환. 없으면 쿠팡 검색 URL fallback."""
+    if query in _CACHED_LINKS:
+        url = _CACHED_LINKS[query].get("url", "")
+        if url and "coupang.com" in url:
+            return url
+    q = urllib.parse.quote(query)
+    return f"https://www.coupang.com/np/search?q={q}&channel=user&subChannel=user"
 
 
 # ─────────────────────────────────────────
@@ -271,14 +296,7 @@ def get_products_for_post(category: str, title: str) -> list[dict]:
 def build_coupang_html(products: list[dict]) -> str:
     items_html = ""
     for product in products[:3]:
-        # 검색어 인코딩 (한글/공백만 인코딩, %는 safe로 두어 이중인코딩 방지)
-        q = urllib.parse.quote(product["query"])          # 한글·공백 → %XX
-        inner_url = f"https://www.coupang.com/np/search?q={q}"
-        # url= 파라미터: 구조 문자(?=:/)도 인코딩하되 이미 인코딩된 %XX는 재인코딩하지 않음
-        link_url = (
-            f"https://link.coupang.com/a/{COUPANG_ID}"
-            f"?url={urllib.parse.quote(inner_url, safe='%')}"
-        )
+        link_url = _get_product_url(product["query"])
         items_html += (
             f"<li style='margin:8px 0;'>"
             f"<a href='{link_url}' target='_blank' rel='noopener sponsored' "
@@ -464,6 +482,10 @@ def main():
     print(f"  쿠팡 파트너스 링크 자동 삽입  ({BLOG_DOMAIN})")
     print(f"  파트너스 ID: {COUPANG_ID}")
     print("=" * 55)
+
+    global _CACHED_LINKS
+    _CACHED_LINKS = load_coupang_links()
+    print(f"  쿠팡 링크 캐시: {len(_CACHED_LINKS)}개 로드")
 
     processed = load_processed()
     print(f"  기존 처리 기록: {len(processed)}개")

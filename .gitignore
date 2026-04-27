@@ -17,3 +17,4 @@ __pycache__/
 # Runtime data
 posted_topics.json
 processed_posts.json
+coupang_links.json
