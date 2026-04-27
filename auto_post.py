@@ -34,7 +34,7 @@ DEFAULT_CATEGORY = "IT/개발"           # 카테고리 미결정 시 기본값
 BLOG_CATEGORIES = [
     "IT/개발", "IT/보안", "IT/면접",
     "일상",
-    "스크랩북/경제",
+    "여러가지/경제",
     "여행",
     "리뷰/잡화", "리뷰/놀이시설", "리뷰/영화", "리뷰/장난감",
     "사진",
@@ -158,14 +158,38 @@ def save_posted_topic(topic: str):
 # 이미지 검색 (Wikipedia API → Picsum fallback)
 # ──────────────────────────────────────────────────
 def _picsum_url(keyword: str, width: int = 800, height: int = 420) -> str:
-    """키워드를 시드로 결정론적 Picsum 이미지 URL 반환 (fallback용)."""
+    """키워드를 시드로 결정론적 Picsum 이미지 URL 반환 (최후 fallback용)."""
     seed = int(hashlib.md5(keyword.encode()).hexdigest(), 16) % 1000
     return f"https://picsum.photos/seed/{seed}/{width}/{height}"
 
 
+def _unsplash_url(query: str, width: int = 800, height: int = 420) -> str | None:
+    """Unsplash Source API로 키워드 기반 관련 이미지 URL 반환.
+    실제 요청을 보내 최종 리다이렉트 URL을 확인한 뒤 반환합니다.
+    """
+    keywords = ",".join(query.split()[:5])  # 최대 5단어
+    encoded = urllib.parse.quote(keywords)
+    url = f"https://source.unsplash.com/{width}x{height}/?{encoded}"
+    try:
+        r = requests.get(url, timeout=8, allow_redirects=True,
+                         headers={"User-Agent": "tistory-autopost/1.0"})
+        if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+            return r.url  # 실제 이미지 URL (리다이렉트 후)
+    except Exception:
+        pass
+    return None
+
+
+# Commons 검색에서 제외할 비관련 파일명 패턴 (지도, 차트, 다이어그램 등)
+_COMMONS_SKIP_PATTERNS = {
+    "map", "world", "distribution", "chart", "graph", "flag",
+    "locator", "globe", "diagram", "template", "blank",
+}
+
+
 def fetch_image_url(query: str) -> str:
-    """검색어로 Wikipedia/Wikimedia Commons에서 관련 이미지 URL을 가져옵니다.
-    우선순위: Commons 파일 → Wikipedia 직접 조회 → Wikipedia 검색 → Picsum
+    """검색어로 관련 이미지 URL을 가져옵니다.
+    우선순위: Commons 파일 → Wikipedia 직접 조회 → Wikipedia 검색 → Unsplash → Picsum
     """
     hdrs = {"User-Agent": "tistory-autopost/1.0"}
     query_keywords = set(query.lower().split())
@@ -181,6 +205,10 @@ def fetch_image_url(query: str) -> str:
                 if page.get("pageid", -1) != -1:
                     src = page.get("thumbnail", {}).get("source")
                     if src:
+                        # 지도/차트 썸네일은 제외
+                        src_lower = src.lower()
+                        if any(p in src_lower for p in _COMMONS_SKIP_PATTERNS):
+                            return None
                         return src
         except Exception:
             pass
@@ -192,20 +220,24 @@ def fetch_image_url(query: str) -> str:
             r = requests.get("https://commons.wikimedia.org/w/api.php", params={
                 "action": "query", "list": "search",
                 "srsearch": query, "srnamespace": "6",  # 파일 네임스페이스
-                "srlimit": 5, "format": "json",
+                "srlimit": 10, "format": "json",
             }, timeout=6, headers=hdrs)
             results = r.json().get("query", {}).get("search", [])
             if not results:
                 return None
 
             # 관련성 정렬: 제목에 쿼리 키워드 많이 포함된 것 우선
-            sorted_r = sorted(
-                results,
-                key=lambda h: len(query_keywords & set(h["title"].lower().split())),
-                reverse=True
-            )
+            scored = []
+            for hit in results:
+                title_lower = hit["title"].lower()
+                # 비관련 파일 제외 (지도, 차트, 다이어그램 등)
+                if any(p in title_lower for p in _COMMONS_SKIP_PATTERNS):
+                    continue
+                score = len(query_keywords & set(title_lower.split()))
+                scored.append((score, hit))
+            scored.sort(key=lambda x: x[0], reverse=True)
 
-            for hit in sorted_r:
+            for _, hit in scored:
                 file_title = hit["title"]
                 # 비미디어 파일 제외 (.pdf, .tiff, .ogg 등)
                 ext = file_title.rsplit(".", 1)[-1].lower()
@@ -226,7 +258,7 @@ def fetch_image_url(query: str) -> str:
             print(f"      Commons 검색 오류: {e}")
         return None
 
-    # 1단계: Wikimedia Commons 파일 직접 검색 (영화 포스터, 로고 등)
+    # 1단계: Wikimedia Commons 파일 직접 검색 (영화 포스터, 로고, 랜드마크 등)
     src = _commons_img(query)
     if src:
         print(f"    이미지(Commons): {query[:30]} → {src[:70]}...")
@@ -261,6 +293,12 @@ def fetch_image_url(query: str) -> str:
                     return src
         except Exception as e:
             print(f"    Wikipedia 검색 오류 ({api_url.split('/')[2][:15]}): {e}")
+
+    # 4단계: Unsplash (키워드 기반 실제 관련 사진)
+    src = _unsplash_url(query)
+    if src:
+        print(f"    이미지(Unsplash): {query[:30]} → {src[:70]}...")
+        return src
 
     # 최종 fallback: Picsum
     url = _picsum_url(query)
@@ -307,20 +345,51 @@ def build_content_with_images(content_html: str, image_queries: list[str]) -> st
 # ──────────────────────────────────────────────────
 # 공통: Gemini 호출 헬퍼
 # ──────────────────────────────────────────────────
+def _claude_fallback_call(prompt: str) -> str:
+    """Gemini quota 소진 시 Claude API (claude-haiku-4-5)로 fallback 호출."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY 없음")
+    import anthropic
+    print("    [claude-haiku-4-5] fallback 호출 중...")
+    client = anthropic.Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=8192,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return msg.content[0].text.strip()
+
+
 def _gemini_call(client, prompt: str) -> str:
-    """quota 소진 시 fallback 모델 순서로 Gemini 호출. 응답 텍스트 반환."""
+    """quota 소진 시 Gemini 모델 순서로 호출, 모두 실패 시 65초 대기 후 재시도."""
     models = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-2.5-flash"]
-    for model_name in models:
-        try:
-            print(f"    [{model_name}] 호출 중...")
-            resp = client.models.generate_content(model=model_name, contents=prompt)
-            return resp.text.strip()
-        except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                print(f"    [{model_name}] quota 소진, 다음 모델 시도...")
-                continue
-            raise
-    raise RuntimeError("모든 Gemini 모델 quota 소진. 내일 다시 시도하세요.")
+    max_rounds = 3  # 전체 모델 순환 최대 횟수
+    for round_no in range(max_rounds):
+        all_quota = True
+        for model_name in models:
+            try:
+                print(f"    [{model_name}] 호출 중...")
+                resp = client.models.generate_content(model=model_name, contents=prompt)
+                return resp.text.strip()
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    print(f"    [{model_name}] quota 소진, 다음 모델 시도...")
+                    continue
+                elif "404" in err or "NOT_FOUND" in err:
+                    print(f"    [{model_name}] 모델 없음, 스킵")
+                    continue
+                else:
+                    raise
+        # 이번 라운드 모든 모델 quota 소진 → 잠시 대기 후 재시도
+        if round_no < max_rounds - 1:
+            wait_sec = 65
+            print(f"    모든 모델 quota 소진 → {wait_sec}초 대기 후 재시도 ({round_no+1}/{max_rounds-1})...")
+            time.sleep(wait_sec)
+    # 모든 재시도 실패 → Claude fallback
+    print("    모든 Gemini quota 소진 → Claude API fallback")
+    return _claude_fallback_call(prompt)
 
 
 def _parse_json(text: str) -> dict:
@@ -417,7 +486,7 @@ def analyze_topics(conv_texts: list[str], n: int = MAX_POSTS,
 - IT/보안: 암호화, PKI, 보안 취약점
 - IT/면접: 개발자 면접, 이력서 팁
 - 일상: 개발자 루틴, 생산성 도구, 취미 생활 → "직장인 재테크 루틴", "개발자 부업 방법"
-- 스크랩북/경제: 주식, 부동산, 재테크 → "ETF 투자 방법", "청약 당첨 전략" (CPC 높음)
+- 여러가지/경제: 주식, 부동산, 재테크 → "ETF 투자 방법", "청약 당첨 전략" (CPC 높음)
 - 여행: 여행지 후기, 맛집, 숙박 → "XX 여행 코스", "항공권 싸게 사는 법"
 - 리뷰/잡화: 전자기기, 생활용품 → "XX 한달 사용 후기", "가성비 XX 추천"
 - 리뷰/영화: 최신 영화·드라마 → "XX 결말 해석", "OTT 추천 영화"
@@ -493,18 +562,29 @@ def generate_blog_post(topic: dict, conv_texts: list[str]) -> tuple[str, str, st
 {{"title": "제목 (60자 이내)", "content": "HTML 본문 (h2/h3/p/ul/li/strong/em/code 태그, 최소 1500자, 큰따옴표 금지)", "tags": "태그1,태그2,...,태그10", "category": "{category_str}", "image_queries": ["섹션1 이미지 검색어(영어)", "섹션2 이미지 검색어(영어)"]}}
 
 image_queries 작성 기준:
-- 반드시 영어로 작성 (Wikimedia Commons + Wikipedia 검색용)
-- 최대한 구체적인 고유명사·공식 명칭으로 작성 (Wikipedia 문서 제목 형식 권장)
+- 반드시 영어로 작성 (Wikimedia Commons + Wikipedia + Unsplash 검색용)
+- Wikimedia Commons/Wikipedia에 실제 존재하는 이미지 우선 (고유명사·공식 명칭)
+  → 없으면 Unsplash에서 키워드 사진으로 대체하므로, 구체적 사물/장면 묘사도 OK
+- 지도(map), 차트(chart), 도표(diagram), 국기(flag) 류는 절대 사용 금지
+  (이유: 검색 결과에 세계지도·국가지도가 나와 내용과 무관한 이미지가 됨)
 - 카테고리별 예시:
   리뷰/영화: "Parasite (film)", "Avengers Endgame", "Squid Game"
   여행: "Gyeongbokgung", "Jeju Island", "Anfield", "Tokyo Shibuya crossing"
   IT/개발: "Python (programming language)", "Docker (software)", "FastAPI"
-  일상: "Standing desk", "Mechanical keyboard", "Lo-fi hip hop"
-  재테크: "Stock market", "Exchange-traded fund", "Seoul apartment"
+  일상: "Standing desk", "mechanical keyboard workspace", "coffee laptop desk"
+  재테크/경제: "stock market trading screen", "gold coins investment", "piggy bank savings", "korean won banknote"
+  세금/절세: "tax return documents form", "calculator pen notebook finance", "income tax paperwork"
   리뷰/잡화: "MacBook Pro", "Sony WH-1000XM5", "iPhone 15"
   리뷰/놀이시설: "Lotte World", "Universal Studios Japan"
+  리뷰/영화: "movie theater popcorn", "film clapperboard", "cinema screen"
+  사진/카메라: "camera lens photography", "DSLR camera"
+- 한국 고유 주제(연말정산·청약·재테크 등)는 구체적 영문 고유명사 대신
+  해당 개념을 잘 나타내는 사물/장면 묘사 영어 키워드를 사용하세요
+  예: 연말정산 → "tax return documents form", "calculator coins money desk"
+      청약 → "apartment building exterior", "housing lottery"
+      재테크 → "investment portfolio stock", "gold bars finance"
 - 4개 제공 (각 h2 섹션마다 1개씩 삽입)
-- 각 쿼리는 해당 섹션 내용과 직접 관련된 구체적 키워드여야 함 (일반 배경 이미지 금지)
+- 각 쿼리는 해당 섹션 내용과 직접 관련된 키워드여야 함
 - 같은 쿼리 반복 금지, 섹션마다 다른 관점의 이미지 제공
 
 작성 지침:
