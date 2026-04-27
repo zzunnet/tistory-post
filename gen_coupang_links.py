@@ -265,111 +265,49 @@ def _generate_via_ui(page, search_url: str) -> str | None:
 
 
 # ─────────────────────────────────────────
-# 파트너스 로그인
+# 파트너스 로그인 (수동)
 # ─────────────────────────────────────────
 def _login_partners(page) -> bool:
-    """쿠팡 파트너스 로그인. 성공 시 True."""
+    """
+    브라우저를 열어 partners.coupang.com으로 이동한 뒤,
+    사용자가 직접 로그인할 때까지 대기합니다.
+    Akamai WAF 때문에 자동 로그인이 차단되므로 수동 로그인 방식을 사용합니다.
+    """
     print("  파트너스 사이트 접속 중...")
     try:
         page.goto("https://partners.coupang.com/", timeout=30000)
         page.wait_for_load_state("networkidle")
-        time.sleep(3)
+        time.sleep(2)
 
-        print(f"  접속 URL: {page.url} / 제목: {page.title()[:40]}")
-
-        # Akamai WAF 차단 확인
-        if "Access Denied" in page.title() or "Access Denied" in page.evaluate("() => document.body.innerText.slice(0, 100)"):
-            print("  Akamai WAF 차단 감지 → 로그인 불가")
-            return False
-
-        # 이미 로그인된 경우
         cur_url = page.url
+
+        # 이미 로그인된 경우 체크
         if "partners.coupang.com" in cur_url and "login" not in cur_url.lower():
-            # 대시보드 요소 확인
-            for sel in [".gnb-user", ".user-info", "[class*='profile']", "[class*='dashboard']", ".main-content"]:
-                try:
-                    page.wait_for_selector(sel, timeout=3000)
-                    print(f"  이미 로그인됨 (요소: {sel})")
-                    return True
-                except:
-                    continue
+            body_text = page.evaluate("() => document.body.innerText.slice(0, 200)")
+            if "Access Denied" not in body_text:
+                print("  이미 로그인된 상태")
+                return True
 
-        # 로그인 버튼 찾아 클릭
-        for sel in ["button:has-text('로그인')", "a:has-text('로그인')", ".login-btn", "[href*='login']"]:
-            try:
-                page.click(sel, timeout=3000)
-                page.wait_for_load_state("networkidle")
-                time.sleep(2)
-                break
-            except:
-                continue
+        # ── 수동 로그인 대기 ──────────────────────────────
+        print()
+        print("  ┌─────────────────────────────────────────────────┐")
+        print("  │  브라우저에서 쿠팡 파트너스에 직접 로그인하세요  │")
+        print("  │  로그인 완료 후 Enter 키를 누르면 계속 진행됩니다 │")
+        print("  └─────────────────────────────────────────────────┘")
+        input("  로그인 완료 후 Enter: ")
 
-        print(f"  로그인 폼 URL: {page.url}")
-        time.sleep(3)
-
-        # Akamai WAF 차단 재확인
-        if "Access Denied" in page.evaluate("() => document.body.innerText.slice(0, 100)"):
-            print("  로그인 페이지 Akamai 차단")
-            return False
-
-        # 이메일 입력
-        email_filled = False
-        for sel in [
-            "input[name='email']",
-            "input[type='email']",
-            "input[name='loginId']",
-            "input[id*='email' i]",
-            "input[placeholder*='이메일']",
-            "input[placeholder*='Email']",
-            "input[type='text']:visible",
-        ]:
-            try:
-                el = page.wait_for_selector(sel, timeout=3000)
-                if el and el.is_visible():
-                    page.fill(sel, COUPANG_EMAIL)
-                    print(f"  이메일 입력: {sel}")
-                    email_filled = True
-                    break
-            except:
-                continue
-
-        if not email_filled:
-            print("  이메일 필드 없음 → 로그인 실패")
-            return False
-
-        # 비밀번호 입력
-        for sel in ["input[name='password']", "input[type='password']"]:
-            try:
-                el = page.wait_for_selector(sel, timeout=3000)
-                if el and el.is_visible():
-                    page.fill(sel, COUPANG_PASSWORD)
-                    break
-            except:
-                continue
-
-        # 제출
-        submitted = False
-        for sel in ["button[type='submit']", ".btn-login", "button:has-text('로그인')", "input[type='submit']"]:
-            try:
-                page.click(sel, timeout=3000)
-                submitted = True
-                break
-            except:
-                continue
-        if not submitted:
-            page.keyboard.press("Enter")
-
-        page.wait_for_load_state("networkidle", timeout=30000)
-        time.sleep(4)
+        page.wait_for_load_state("networkidle", timeout=15000)
+        time.sleep(2)
 
         final_url = page.url
-        print(f"  로그인 결과 URL: {final_url}")
+        body_text  = page.evaluate("() => document.body.innerText.slice(0, 200)")
+
+        if "Access Denied" in body_text:
+            print("  Akamai 차단 감지 → 로그인 실패")
+            return False
 
         success = "partners.coupang.com" in final_url and "login" not in final_url.lower()
-        if success:
-            print("  로그인 성공")
-        else:
-            print("  로그인 실패")
+        print(f"  {'로그인 성공' if success else '로그인 실패'} — {final_url[:60]}")
         return success
 
     except Exception as e:
